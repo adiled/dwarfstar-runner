@@ -1,0 +1,8 @@
+ORCH_VERSION 1.0.0-rc
+
+SERVICE arbiter
+RUN bash -c 'exec ~/ds4-runner/arbiter --dir ~/ds4-runner --orch ~/.local/bin/orch --orchd ~/.local/bin/orchd --listen 127.0.0.1:8899'
+STDOUT /tmp/ds4-arbiter.log
+STDERR /tmp/ds4-arbiter.log
+HEALTHCHECK http://127.0.0.1:8899/health
+RESTART always
