@@ -19,9 +19,20 @@ disappear as requests arrive, so there are no per-model commands to run.
 
 ## How it works
 
-Each model is described by a spec in `services/`. The arbiter reads that directory
-and parses every spec with `orch parse`, so the roster is whatever the files
-declare.
+[orchd](https://github.com/adiled/orchd) starts and supervises processes from a
+declarative file called an Orchfile. An Orchfile lists the services to run, the
+command for each service, its environment, and a probe that reports whether the
+service is ready. The Orchfile spec is documented under [Write an
+Orchfile](https://github.com/adiled/orchd#write-an-orchfile), and the model that
+gives it its vocabulary of groves, sow, plant and tend is described in [The
+Orchard Model](https://github.com/adiled/orchd/blob/main/ORCHARD.md).
+
+Each model here has its own Orchfile in `services/`. The arbiter reads that
+directory, parses every Orchfile with `orch parse`, and treats the result as the
+roster, so the available models are the files that are present. Each Orchfile is
+planted into its own grove, which is a namespace with its own state directory.
+Separate groves are what allow the arbiter to stop one model while the rest stay
+untouched.
 
 The arbiter runs in its own grove. For each request it resolves the model name,
 asks `orchd survey` which grove holds the GPU, stops the other groves with
@@ -30,13 +41,13 @@ asks `orchd survey` which grove holds the GPU, stops the other groves with
 streams pass through unchanged, and every connection forks its own process so a
 long switch cannot hold up other clients.
 
-The public interface is OpenAI's `/v1`. The `ENV MODELS` line in each spec lists
-the names its grove answers to.
+The public interface is OpenAI's `/v1`. The `ENV MODELS` line in each Orchfile
+lists the names its grove answers to.
 
-ds4 holds an exclusive lock on `DS4_LOCK_FILE`, and every spec points at the same
-file. One model can hold the GPU at a time, whichever way it was started. The
-arbiter stops the current model before it starts the next, which keeps the lock
-free during normal use.
+ds4 holds an exclusive lock on `DS4_LOCK_FILE`, and every Orchfile points at the
+same file. One model can hold the GPU at a time, whichever way it was started.
+The arbiter stops the current model before it starts the next, which keeps the
+lock free during normal use.
 
 ## Roadmap
 
@@ -48,10 +59,11 @@ missing capability.
 | Limitation | Missing capability | Effect once it exists |
 | --- | --- | --- |
 | `fell` removes a whole state directory, and there is no way to stop one service | per-service stop in the `orchdi` platform, tracked by pidfile | models can share a single grove |
-| a spec is read once, so an edit needs `fell` and `grow` | spec adoption, which reconciles edits in place | one file can hold the roster and the selected model |
+| an Orchfile is read once, so an edit needs `fell` and `grow` | adoption of an edited Orchfile, which reconciles it in place | one file can hold the roster and the selected model |
 | nothing states that two services cannot run together | an `EXCLUSIVE <resource>` directive with `PREEMPT` | `orchd` performs the GPU swap itself |
 
-With those in place the specs merge into a single file and the arbiter goes away:
+With those in place the Orchfiles merge into a single file and the arbiter goes
+away:
 
 ```dockerfile
 SERVICE glm53server
