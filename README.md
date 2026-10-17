@@ -51,27 +51,23 @@ lock free during normal use.
 
 ## Roadmap
 
-The repository currently runs one grove per model plus a controller grove for the
-arbiter. The intended end state is a single grove that needs no arbiter. Three
-limitations in `orchd` 0.3.4 cause the split, and each one corresponds to a
-missing capability.
+This repository runs one grove per model plus a controller grove for the arbiter.
+The arbiter exists because orchd does not yet cover the work directly, so the
+shape of this repository tracks the state of that project.
 
-| Limitation | Missing capability | Effect once it exists |
-| --- | --- | --- |
-| `fell` removes a whole state directory, and there is no way to stop one service | per-service stop in the `orchdi` platform, tracked by pidfile | models can share a single grove |
-| an Orchfile is read once, so an edit needs `fell` and `grow` | adoption of an edited Orchfile, which reconciles it in place | one file can hold the roster and the selected model |
-| nothing states that two services cannot run together | an `EXCLUSIVE <resource>` directive with `PREEMPT` | `orchd` performs the GPU swap itself |
+What orchd does not do yet:
 
-With those in place the Orchfiles merge into a single file and the arbiter goes
-away:
+- `fell` removes the whole state directory of a grove, and no verb stops one
+  service on its own. The `orchdi` platform contains `stop(services)`, and the
+  CLI does not expose it.
+- `RELOAD` is in the Orchfile grammar and unimplemented, so an edit needs `fell`
+  and `grow`. Tracked as [orchd#54](https://github.com/adiled/orchd/issues/54).
+- `RECREATE` is unimplemented. Tracked as
+  [orchd#59](https://github.com/adiled/orchd/issues/59).
+- `survey` reports a running service as inactive, which leaves the process id as
+  the only reliable field. Tracked as
+  [orchd#56](https://github.com/adiled/orchd/issues/56).
 
-```dockerfile
-SERVICE glm53server
-RUN ... --port 8889 ...
-EXCLUSIVE gpu
-PREEMPT ds4server
-```
-
-A switch then becomes `orchd --platform orchdi grow glm53server`. The arbiter is a
-hand-rolled version of this loop: a grove stands in for the service, `fell` stands
-in for the stop, and the lock stands in for the exclusive slot.
+With a per-service stop and an in-place reload, the five models could share a
+single grove. The arbiter would still choose which model runs, and the
+grove-per-model split would disappear.
