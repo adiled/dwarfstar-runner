@@ -1,13 +1,9 @@
 #!/bin/sh
-# Start the ds4 front door. That's the whole story:
+# Start the ds4 front door (building it first if needed).
 #
-#   ./run            build if needed, then start it
-#   ./run restart    restart it (after changing specs or code)
-#   ./run down       stop everything — every model, then the front door
-#
-# From then on it owns the GPU: a client names a model and the front door
-# swaps the holder under a single lock. There is no per-model command —
-# power users drive `orchd` directly.
+# Then point a client at http://127.0.0.1:8899/v1 and name a model. The front
+# door owns the GPU and swaps the holder under a single lock. To stop
+# everything, run ./stop. Power users can drive `orchd` directly.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -16,27 +12,7 @@ ORCHD=${ORCHD:-$HOME/.local/bin/orchd}
 [ -x "$ORCHD" ] || ORCHD=orchd
 state_root=${STATE_ROOT:-$HOME/.orch/g}
 
-build() {
-    [ -x "$ROOT/arbiter" ] || make -C "$ROOT"
-}
+[ -x "$ROOT/arbiter" ] || make -C "$ROOT"
 
-ctl() {
-    "$ORCHD" --project-dir "$ROOT" --state-dir "$state_root/ctl" \
-             --orchfile "$ROOT/arbiter.orch" --namespace ctl --user "$@"
-}
-
-# Fell every model grove, so nothing is left holding the GPU.
-models_down() {
-    for f in "$ROOT"/services/*.orch; do
-        n=$(basename "$f" .orch)
-        "$ORCHD" --project-dir "$ROOT" --state-dir "$state_root/$n" \
-                 --namespace "$n" --user fell --keep-data >/dev/null 2>&1 || true
-    done
-}
-
-case "${1:-up}" in
-    up)      build; ctl grow ;;
-    restart) build; ctl fell --keep-data >/dev/null 2>&1 || true; ctl grow ;;
-    down)    models_down; ctl fell --keep-data >/dev/null 2>&1 || true ;;
-    *)       echo "usage: $0 [up|restart|down]" >&2; exit 2 ;;
-esac
+"$ORCHD" --project-dir "$ROOT" --state-dir "$state_root/ctl" \
+         --orchfile "$ROOT/arbiter.orch" --namespace ctl --user grow

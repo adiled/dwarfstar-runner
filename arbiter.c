@@ -17,12 +17,8 @@
  * The GPU itself is still guarded by ds4's own flock: every model spec sets the
  * same DS4_LOCK_FILE, so at most one model ever runs.
  *
- *   GET  /health          -> {"ok":true}
- *   GET  /state           -> {"active":<name|null>,"port":<int|null>}
- *   GET  /models          -> each model with running/healthy
- *   POST /use/<name>      -> switch; blocks until the model answers
- *   POST /use             -> body {"model":"<name>"}
- *   POST /stop            -> fell every model grove
+ *   GET  /v1/models       -> every advertised id
+ *   POST /v1/*            -> resolve "model" -> raise the grove -> relay
  */
 
 #define _DARWIN_C_SOURCE
