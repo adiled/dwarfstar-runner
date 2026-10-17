@@ -4,5 +4,5 @@ SERVICE arbiter
 RUN bash -c 'exec "${ORCH_PROJECT}/arbiter" --dir "${ORCH_PROJECT}" --orch ~/.local/bin/orch --orchd ~/.local/bin/orchd --listen 127.0.0.1:8899'
 STDOUT /tmp/ds4-arbiter.log
 STDERR /tmp/ds4-arbiter.log
-HEALTHCHECK http://127.0.0.1:8899/health
+HEALTHCHECK http://127.0.0.1:8899/v1/models
 RESTART always

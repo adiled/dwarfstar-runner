@@ -295,18 +295,6 @@ static int grove_pid(const char *name) {
     return 0;
 }
 
-/* PID of the current holder per grove, or 0. Filled in one pass so a request
- * doesn't shell out to orchd more than once per model. */
-static void snapshot(int *pids) {
-    for (int i = 0; i < nmodels; i++) pids[i] = grove_pid(models[i].name);
-}
-
-static int active_from(const int *pids) {
-    for (int i = 0; i < nmodels; i++)
-        if (pids[i] > 0) return i;
-    return -1;
-}
-
 /*
  * Switch to `name`. Returns its port on success, -1 on timeout, -2 if unknown.
  */
@@ -519,132 +507,65 @@ static void dispatch(int fd, const char *method, const char *path,
     char *qs = strchr(q, '?');
     if (qs) *qs = '\0';
 
-    if (strcmp(method, "GET") == 0) {
-        if (strcmp(q, "/health") == 0) {
-            send_all(fd, 200, "OK", "{\"ok\":true}");
-        } else if (strcmp(q, "/state") == 0) {
-            int pids[MAX_MODELS];
-            snapshot(pids);
-            int ai = active_from(pids);
-            char out[256];
-            if (ai < 0) snprintf(out, sizeof out, "{\"active\":null,\"port\":null,\"pid\":null}");
-            else snprintf(out, sizeof out,
-                          "{\"active\":\"%s\",\"port\":%d,\"pid\":%d}",
-                          models[ai].name, models[ai].port, pids[ai]);
-            send_all(fd, 200, "OK", out);
-        } else if (strcmp(q, "/models") == 0) {
-            sbuf_t s = {0};
-            int pids[MAX_MODELS];
-            snapshot(pids);
-            int ai = active_from(pids);
-            if (ai < 0) sb_add(&s, "{\"active\":null,\"models\":[");
-            else sb_add(&s, "{\"active\":\"%s\",\"models\":[", models[ai].name);
-            for (int i = 0; i < nmodels; i++) {
-                int up = pids[i] > 0 && http_ok(models[i].health);
-                sb_add(&s, "%s{\"name\":\"%s\",\"port\":%d,\"file\":\"%s\","
-                           "\"health\":\"%s\",\"pid\":%d,\"healthy\":%s}",
-                       i ? "," : "", models[i].name, models[i].port,
-                       models[i].file, models[i].health, pids[i],
-                       up ? "true" : "false");
-            }
-            sb_add(&s, "]}");
-            send_all(fd, 200, "OK", s.buf ? s.buf : "{}");
-            free(s.buf);
-        } else if (strcmp(q, "/v1/models") == 0) {
-            /* Advertise every name any grove answers to, so a client can ask
-             * for one and let the front door raise it. */
-            sbuf_t s = {0};
-            sb_add(&s, "{\"object\":\"list\",\"data\":[");
-            int first = 1;
-            for (int i = 0; i < nmodels; i++) {
-                char tmp[1024];
-                snprintf(tmp, sizeof tmp, "%s", models[i].ids);
-                for (char *tok = strtok(tmp, ","); tok; tok = strtok(NULL, ","))
-                    if (tok[0]) {
-                        sb_add(&s, "%s{\"id\":\"%s\",\"object\":\"model\","
-                                   "\"owned_by\":\"ds4\"}",
-                               first ? "" : ",", tok);
-                        first = 0;
-                    }
-            }
-            sb_add(&s, "]}");
-            send_all(fd, 200, "OK",
-                     s.buf ? s.buf : "{\"object\":\"list\",\"data\":[]}");
-            free(s.buf);
-        } else {
-            send_all(fd, 404, "Not Found", "{\"error\":\"not found\"}");
+    /* The whole public surface is OpenAI's /v1. A harness names a model and
+     * nothing else; model lifecycle is not its concern. */
+
+    if (strcmp(method, "GET") == 0 && strcmp(q, "/v1/models") == 0) {
+        /* Every name any grove answers to, so a client can ask for one and
+         * let the front door raise it. */
+        sbuf_t s = {0};
+        sb_add(&s, "{\"object\":\"list\",\"data\":[");
+        int first = 1;
+        for (int i = 0; i < nmodels; i++) {
+            char tmp[1024];
+            snprintf(tmp, sizeof tmp, "%s", models[i].ids);
+            for (char *tok = strtok(tmp, ","); tok; tok = strtok(NULL, ","))
+                if (tok[0]) {
+                    sb_add(&s, "%s{\"id\":\"%s\",\"object\":\"model\","
+                               "\"owned_by\":\"ds4\"}",
+                           first ? "" : ",", tok);
+                    first = 0;
+                }
         }
+        sb_add(&s, "]}");
+        send_all(fd, 200, "OK",
+                 s.buf ? s.buf : "{\"object\":\"list\",\"data\":[]}");
+        free(s.buf);
         return;
     }
 
-    if (strcmp(method, "POST") == 0) {
-        if (strcmp(q, "/stop") == 0) {
-            for (int i = 0; i < nmodels; i++)
-                if (grove_pid(models[i].name) > 0) grove_fell(models[i].name);
-            send_all(fd, 200, "OK", "{\"ok\":true,\"stopped\":true}");
+    if (strcmp(method, "POST") == 0 && strncmp(q, "/v1/", 4) == 0) {
+        /* Read the requested model, raise its grove if needed, then stream
+         * the backend's response back verbatim. */
+        char *mid = (body && clen > 0) ? json_get_string(body, "model") : NULL;
+        if (!mid) {
+            send_all(fd, 400, "Bad Request", "{\"error\":\"missing model\"}");
             return;
         }
-        if (strcmp(q, "/use") == 0 || strncmp(q, "/use/", 5) == 0) {
-            char target[128] = {0};
-            if (strncmp(q, "/use/", 5) == 0) {
-                snprintf(target, sizeof target, "%s", q + 5);
-            } else if (body && clen > 0 && clen < RECV_MAX) {
-                char *m = json_get_string(body, "model");
-                if (m) { snprintf(target, sizeof target, "%s", m); free(m); }
-            }
-            if (!target[0]) {
-                send_all(fd, 400, "Bad Request", "{\"error\":\"missing model\"}");
-                return;
-            }
+        int ti = find_by_model_id(mid);
+        if (ti < 0) {
+            char out[320];
+            snprintf(out, sizeof out,
+                     "{\"error\":\"unknown model\",\"model\":\"%s\"}", mid);
+            send_all(fd, 404, "Not Found", out);
+            free(mid);
+            return;
+        }
+        free(mid);
+
+        if (!(grove_pid(models[ti].name) > 0 && http_ok(models[ti].health))) {
             char err[256] = {0};
-            int port = switch_to(target, timeout, err, sizeof err);
-            if (port == -2) {
-                send_all(fd, 404, "Not Found", "{\"error\":\"unknown model\"}");
-            } else if (port < 0) {
+            logf_("/v1 wants %s -> switching", models[ti].name);
+            if (switch_to(models[ti].name, timeout, err, sizeof err) < 0) {
                 char out[320];
                 snprintf(out, sizeof out, "{\"error\":\"%s\"}", err);
                 send_all(fd, 503, "Service Unavailable", out);
-            } else {
-                char out[256];
-                snprintf(out, sizeof out,
-                         "{\"ok\":true,\"model\":\"%s\",\"port\":%d}", target, port);
-                send_all(fd, 200, "OK", out);
-            }
-            return;
-        }
-        if (strncmp(q, "/v1/", 4) == 0) {
-            /* Inference front door: read the requested model, raise its grove
-             * if needed, then stream the backend's response back verbatim. */
-            char *mid = (body && clen > 0) ? json_get_string(body, "model") : NULL;
-            if (!mid) {
-                send_all(fd, 400, "Bad Request", "{\"error\":\"missing model\"}");
                 return;
             }
-            int ti = find_by_model_id(mid);
-            if (ti < 0) {
-                char out[320];
-                snprintf(out, sizeof out,
-                         "{\"error\":\"unknown model\",\"model\":\"%s\"}", mid);
-                send_all(fd, 404, "Not Found", out);
-                free(mid);
-                return;
-            }
-            free(mid);
-
-            if (!(grove_pid(models[ti].name) > 0 && http_ok(models[ti].health))) {
-                char err[256] = {0};
-                logf_("/v1 wants %s -> switching", models[ti].name);
-                if (switch_to(models[ti].name, timeout, err, sizeof err) < 0) {
-                    char out[320];
-                    snprintf(out, sizeof out, "{\"error\":\"%s\"}", err);
-                    send_all(fd, 503, "Service Unavailable", out);
-                    return;
-                }
-            }
-            logf_("/v1 %s -> :%d", q, models[ti].port);
-            proxy_to(fd, ti, path, body, clen);
-            return;
         }
+        logf_("/v1 %s -> :%d", q, models[ti].port);
+        proxy_to(fd, ti, path, body, clen);
+        return;
     }
 
     send_all(fd, 404, "Not Found", "{\"error\":\"not found\"}");

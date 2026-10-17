@@ -1,13 +1,15 @@
 #!/bin/sh
 # Grow the ds4 front door. This is the whole install:
 #
-#   ./run            build if needed, then grow the controller grove
-#   ./run restart    fell + grow the controller (pick up spec/binary changes)
-#   ./run down       tear the controller grove down
-#   ./run build      just build the arbiter
-#   ./run <model> <verb> [...]   manual poke at one model grove, e.g.
-#                                ./run glm53server grow
-#                                ./run ds4server fell --keep-data
+#   ./run            build if needed, then start the front door. That's it.
+#   ./run restart    restart the front door (after changing specs or code)
+#   ./run down       stop the front door
+#   ./run stop       unload every model, freeing the GPU
+#   ./run status     list each model and whether it is running
+#   ./run build      just build the front door
+#   ./run <model> <verb> [...]   poke one model directly, e.g.
+#                                ./run glm53server grow   (start it)
+#                                ./run ds4server fell     (stop it)
 #
 # After `./run`, point any OpenAI client at http://127.0.0.1:8899/v1 and ask
 # for a model by name; the front door raises it. No per-model commands needed
@@ -40,5 +42,14 @@ case "${1:-up}" in
     restart) build; ctl fell --keep-data || true; ctl grow ;;
     down)    ctl fell --keep-data ;;
     build)   build ;;
+    stop)    for f in "$ROOT"/services/*.orch; do
+                 mdl "$(basename "$f" .orch)" fell --keep-data || true
+             done ;;
+    status)  for f in "$ROOT"/services/*.orch; do
+                 n=$(basename "$f" .orch)
+                 printf '%-22s ' "$n"
+                 mdl "$n" survey --json 2>/dev/null | tr -d '\n' || true
+                 echo
+             done ;;
     *)       name=$1; shift; mdl "$name" "$@" ;;
 esac

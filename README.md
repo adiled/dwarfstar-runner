@@ -40,23 +40,23 @@ ds4-runner/
 ## Run
 
 ```sh
-./run             # make if needed, then grow the controller grove. That's it.
+./run              # build if needed, then start the front door. That's it.
 ```
 
 Then point a client at `http://127.0.0.1:8899/v1` and name a model. Models are
 raised on demand — no per-model step in normal use.
 
 ```sh
-./run restart                          # fell + grow (pick up spec/binary changes)
-./run down                             # tear the controller grove down
-./run <model> <verb> [...]             # manual poke:
-./run glm53server grow                 #   start one model
-./run ds4server fell --keep-data        #   stop exactly that model
+./run restart      # restart the front door (after changing specs or code)
+./run stop         # unload every model, freeing the GPU
+./run status       # list each model and whether it is running
+./run down         # stop the front door
+./run glm53server grow          # manual: start just that model
+./run ds4server fell            # manual: stop just that model
 ```
 
-`./run` just wraps the long `orchd` call (per-grove `--state-dir` +
-`--namespace` + `--orchfile`, flags before the subcommand). Only the `ctl` grove
-stays installed; model groves are grown/felled by the arbiter.
+`./run` just wraps a long `orchd` command. Only the front door is installed at
+boot; models are started and stopped by the arbiter as requests name them.
 
 ## Specs
 
@@ -67,7 +67,7 @@ stays installed; model groves are grown/felled by the arbiter.
 ```dockerfile
 SERVICE arbiter
 RUN bash -c 'exec "${ORCH_PROJECT}/arbiter" --dir "${ORCH_PROJECT}" --orch ~/.local/bin/orch --orchd ~/.local/bin/orchd --listen 127.0.0.1:8899'
-HEALTHCHECK http://127.0.0.1:8899/health
+HEALTHCHECK http://127.0.0.1:8899/v1/models
 RESTART always
 ```
 
@@ -93,15 +93,14 @@ RESTART no
 
 ## arbiter
 
+Its public surface is OpenAI's `/v1` — nothing else. A harness names a model;
+model lifecycle is not its concern.
+
 | Route | Purpose |
 | --- | --- |
-| `GET /health` | liveness |
-| `GET /state` | `{"active","port","pid"}` |
-| `GET /models` | each grove + `pid` + `healthy` |
-| `POST /use/<name>` | switch; blocks until ready |
-| `POST /stop` | fell every model grove |
-| `GET /v1/models` | every advertised id |
-| `POST /v1/chat/completions` | resolve → raise → relay |
+| `GET /v1/models` | every advertised id (also the grove's health probe) |
+| `POST /v1/chat/completions` | resolve `"model"` → raise the grove → relay the response verbatim |
+| any other `/v1/*` | same: resolve, raise, relay |
 
 Flags: `--dir --orch --orchd --state-root --listen --timeout --dump`.
 
@@ -109,10 +108,10 @@ Flags: `--dir --orch --orchd --state-root --listen --timeout --dump`.
 others → `grow` target → poll `HEALTHCHECK` to 200. Fork-per-connection, so a
 switch or a stream never blocks the accept loop.
 
-**Front door:** `wme`/any OpenAI client points at `http://127.0.0.1:8899/v1`
-once. `/v1/models` lists all ids; on `/v1/chat/completions` the arbiter resolves
-`"model"` → grove, raises it, relays the response verbatim (streaming included).
-No `/use` needed. `ENV MODELS` maps station names → groves.
+**Client:** point at `http://127.0.0.1:8899/v1` once. `ENV MODELS` maps station
+names → groves. No side-channel call; the request's `"model"` *is* the switch.
+
+Lifecycle-only actions live in `./run` (`stop`, `status`), not the API.
 
 ## Mutual exclusion
 
