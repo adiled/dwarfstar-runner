@@ -1,9 +1,5 @@
 ORCH_VERSION 1.0.0-rc
 
-# DS4 inference servers, migrated 1:1 from ~/Library/LaunchAgents/com.dwarfstar.*.plist
-# Tuned: expert cache left automatic (dropped oversized 96GB budget + explicit
-# preload-experts), native session batching enabled. Grow: orchd --user grow
-
 SERVICE ds4server
 RUN bash -c 'cd ~/projects/ds4 && exec nice -n 10 ~/projects/ds4/ds4-server --model ~/projects/ds4/gguf/DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf --host 0.0.0.0 --port 8888 --cors --ctx 100000 --ssd-streaming --kv-disk-dir ~/.ds4/server-kv --kv-disk-space-mb 16384 --batched-session 4 --threads 8'
 ENV DS4_LOCK_FILE=/tmp/ds4-flash.lock
@@ -11,9 +7,30 @@ STDOUT /tmp/ds4-server.log
 STDERR /tmp/ds4-server.log
 RESTART always
 
+SERVICE ds4flash-q2
+RUN bash -c 'cd ~/projects/ds4 && exec nice -n 10 ~/projects/ds4/ds4-server --model ~/projects/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf --host 0.0.0.0 --port 8890 --cors --ctx 32768 --ssd-streaming --batched-session 4 --threads 8'
+ENV DS4_LOCK_FILE=/tmp/ds4-flash-q2.lock
+STDOUT /tmp/ds4-flash-q2.log
+STDERR /tmp/ds4-flash-q2.log
+RESTART always
+
+SERVICE ds4flash-q2-legacy
+RUN bash -c 'cd ~/projects/ds4 && exec nice -n 10 ~/projects/ds4/ds4-server --model ~/projects/ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf --host 0.0.0.0 --port 8891 --cors --ctx 32768 --ssd-streaming --batched-session 4 --threads 8'
+ENV DS4_LOCK_FILE=/tmp/ds4-flash-q2-legacy.lock
+STDOUT /tmp/ds4-flash-q2-legacy.log
+STDERR /tmp/ds4-flash-q2-legacy.log
+RESTART always
+
 SERVICE ds41server
-RUN bash -c 'cd ~/projects/ds4 && exec nice -n 10 ~/projects/ds4/ds4-server --model ~/projects/ds4/gguf/DeepSeek-V4.1-Flash-Q2.gguf --host 0.0.0.0 --port 8887 --cors --ctx 65536 --ssd-streaming --batched-session 4'
+RUN bash -c 'cd ~/projects/ds4 && exec nice -n 10 ~/projects/ds4/ds4-server --model ~/projects/ds4/gguf/DeepSeek-V4.1-Flash-Q2.gguf --host 0.0.0.0 --port 8887 --cors --ctx 65536 --ssd-streaming --batched-session 4 --threads 8'
 ENV DS4_LOCK_FILE=/tmp/ds41-flash.lock
 STDOUT /tmp/ds41-server.log
 STDERR /tmp/ds41-server.log
+RESTART always
+
+SERVICE glm53server
+RUN bash -c 'cd ~/projects/ds4 && exec nice -n 10 ~/projects/ds4/ds4-server --model ~/projects/ds4/gguf/GLM-5.3-Flash-Q2.gguf --host 0.0.0.0 --port 8889 --cors --backend metal --ctx 32768 --ssd-streaming --batched-session 4 --threads 8'
+ENV DS4_LOCK_FILE=/tmp/ds4-glm53.lock
+STDOUT /tmp/ds4-glm53.log
+STDERR /tmp/ds4-glm53.log
 RESTART always
