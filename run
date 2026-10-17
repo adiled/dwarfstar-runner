@@ -1,0 +1,44 @@
+#!/bin/sh
+# Grow the ds4 front door. This is the whole install:
+#
+#   ./run            build if needed, then grow the controller grove
+#   ./run restart    fell + grow the controller (pick up spec/binary changes)
+#   ./run down       tear the controller grove down
+#   ./run build      just build the arbiter
+#   ./run <model> <verb> [...]   manual poke at one model grove, e.g.
+#                                ./run glm53server grow
+#                                ./run ds4server fell --keep-data
+#
+# After `./run`, point any OpenAI client at http://127.0.0.1:8899/v1 and ask
+# for a model by name; the front door raises it. No per-model commands needed
+# in normal use.
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+ORCHD=${ORCHD:-$HOME/.local/bin/orchd}
+[ -x "$ORCHD" ] || ORCHD=orchd
+state_root=${STATE_ROOT:-$HOME/.orch/g}
+
+build() {
+    [ -x "$ROOT/arbiter" ] || make -C "$ROOT"
+}
+
+ctl() {
+    "$ORCHD" --project-dir "$ROOT" --state-dir "$state_root/ctl" \
+             --orchfile "$ROOT/arbiter.orch" --namespace ctl --user "$@"
+}
+
+mdl() {
+    name=$1; shift
+    "$ORCHD" --project-dir "$ROOT" --state-dir "$state_root/$name" \
+             --orchfile "$ROOT/services/$name.orch" --namespace "$name" --user "$@"
+}
+
+case "${1:-up}" in
+    up)      build; ctl grow ;;
+    restart) build; ctl fell --keep-data || true; ctl grow ;;
+    down)    ctl fell --keep-data ;;
+    build)   build ;;
+    *)       name=$1; shift; mdl "$name" "$@" ;;
+esac

@@ -11,6 +11,7 @@ C sidecar (`arbiter`) that raises whichever model a request names.
 
 ```
 ds4-runner/
+├── run                                   # build + grow (the only entry point)
 ├── arbiter.c  tinyjson.{c,h}  Makefile   # front door + switch engine
 ├── .orchrc                               # scope=user
 ├── arbiter.orch                          # grove "ctl"
@@ -36,13 +37,26 @@ ds4-runner/
 | `glm53server` | GLM 5.3 Flash Q2 | 90 GiB | 8889 | `glm-5.2`, `glm-5.2-chat`, `glm-5.2-reasoner` |
 | `arbiter` | (front door) | — | 8899 | — |
 
-## Build
+## Run
 
 ```sh
-make     # cc -O2 -std=c11 -o arbiter arbiter.c tinyjson.c
+./run             # make if needed, then grow the controller grove. That's it.
 ```
 
-`arbiter.orch` runs `~/ds4-runner/arbiter`, so build before first grow.
+Then point a client at `http://127.0.0.1:8899/v1` and name a model. Models are
+raised on demand — no per-model step in normal use.
+
+```sh
+./run restart                          # fell + grow (pick up spec/binary changes)
+./run down                             # tear the controller grove down
+./run <model> <verb> [...]             # manual poke:
+./run glm53server grow                 #   start one model
+./run ds4server fell --keep-data        #   stop exactly that model
+```
+
+`./run` just wraps the long `orchd` call (per-grove `--state-dir` +
+`--namespace` + `--orchfile`, flags before the subcommand). Only the `ctl` grove
+stays installed; model groves are grown/felled by the arbiter.
 
 ## Specs
 
@@ -52,7 +66,7 @@ make     # cc -O2 -std=c11 -o arbiter arbiter.c tinyjson.c
 
 ```dockerfile
 SERVICE arbiter
-RUN bash -c 'exec ~/ds4-runner/arbiter --dir ~/ds4-runner --orch ~/.local/bin/orch --orchd ~/.local/bin/orchd --listen 127.0.0.1:8899'
+RUN bash -c 'exec "${ORCH_PROJECT}/arbiter" --dir "${ORCH_PROJECT}" --orch ~/.local/bin/orch --orchd ~/.local/bin/orchd --listen 127.0.0.1:8899'
 HEALTHCHECK http://127.0.0.1:8899/health
 RESTART always
 ```
@@ -76,23 +90,6 @@ RESTART no
 - shared `DS4_LOCK_FILE` → single GPU holder.
 - `RESTART no` — lock losers `exit(2)` and must stay down.
 - `ENV MODELS` — names the front door advertises for this grove.
-
-## Commands
-
-```sh
-ROOT=~/ds4-runner; ORCHD=~/.local/bin/orchd
-ctl() { $ORCHD --project-dir $ROOT --state-dir ~/.orch/g/ctl \
-              --orchfile $ROOT/arbiter.orch --namespace ctl --user "$@"; }
-mdl() { $ORCHD --project-dir $ROOT --state-dir ~/.orch/g/$1 \
-              --orchfile $ROOT/services/$1.orch --namespace $1 --user "${@:2}"; }
-
-ctl grow                            # install + start the arbiter
-mdl ds4server grow                  # start one model
-mdl glm53server fell --keep-data    # stop exactly that model
-```
-
-Flags precede the subcommand (`--user` is not global in 0.3.4). Keep only the
-`ctl` grove installed; grow/fall model groves on demand.
 
 ## arbiter
 
