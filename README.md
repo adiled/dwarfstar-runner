@@ -159,8 +159,8 @@ Apps never kill processes. They ask the arbiter on `127.0.0.1:8899`.
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /health` | arbiter liveness |
-| `GET /state` | `{"active": <name>\|null, "port": <int>\|null}` |
-| `GET /models` | each model + `healthy`, plus the active one |
+| `GET /state` | `{"active": <name>\|null, "port": <int>\|null, "pid": <int>\|null}` |
+| `GET /models` | each model + its orchd `pid` + `healthy`, plus the active one |
 | `POST /use/<name>` (or `/use` `{"model":"…"}`) | switch; blocks until ready |
 | `POST /stop` | stop every model grove |
 
@@ -172,13 +172,19 @@ curl -s -X POST 'http://127.0.0.1:8899/use/ds41server?timeout=1800'
 
 A switch (`switch_to` in `arbiter.c`):
 
-1. If the target already answers its health URL, return its port — no-op.
-2. Otherwise `fell --keep-data` every other grove whose health check answers
-   (that model is the current holder; its `DS4_LOCK_FILE` is released as it
-   exits).
-3. `grow` the target grove, then poll its `HEALTHCHECK` until HTTP 200 or
-   `--timeout` (default 900 s).
-4. Return `{"ok":true,"model":…,"port":…}`.
+1. **Who is running is asked of orchd, not launchd.** For each grove the
+   arbiter runs `orchd … survey --json` and reads the reported `pid` — a live
+   PID is the holder. (Trust the PID, not `state`: launchd reports
+   `state = active` while orchd 0.3.4 only maps the literal `running`, so
+   `state` reads `inactive` even for a live job.)
+2. If the target is already the holder **and** answers its health URL, return
+   its port — no-op.
+3. Otherwise `fell --keep-data` every other grove orchd reports with a live
+   PID (that model is the holder; its `DS4_LOCK_FILE` is released as it exits).
+4. `grow` the target grove, then poll its `HEALTHCHECK` until HTTP 200 or
+   `--timeout` (default 900 s) — orchd says *started*, health says *serving*.
+   Both are needed: a PID exists before the weights are loaded.
+5. Return `{"ok":true,"model":…,"port":…}`.
 
 The call **blocks** until the model is serving, so the caller can immediately
 use the port. The accept loop is single-threaded, so switches serialize

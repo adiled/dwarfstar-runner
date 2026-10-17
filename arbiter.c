@@ -260,9 +260,45 @@ static int find_model(const char *name) {
     return -1;
 }
 
-static int active_index(void) {
+/*
+ * Who is running, according to orchd itself. `orchd survey --json` reports a
+ * PID per service; a positive PID that is still alive means the grove holds
+ * the GPU. We ask orchd rather than poking launchd/plists directly — it owns
+ * the lifecycle, so it owns the answer.
+ *
+ * (Trust the PID, not the `state` field: launchd 6.x reports `state = active`
+ * while orchd 0.3.4 only maps the literal `running` to "active", so `state`
+ * reads "inactive" even for a live job. The PID is correct either way.)
+ *
+ * Returns the PID, or 0 when the grove is absent or not running.
+ */
+static int grove_pid(const char *name) {
+    char cmd[PATH_MAX * 4];
+    snprintf(cmd, sizeof cmd,
+             "'%s' --project-dir '%s' --state-dir '%s/%s' --namespace '%s' "
+             "--user survey --json 2>/dev/null",
+             g_orchd, g_dir, g_state_root, name, name);
+
+    char *json = NULL;
+    if (run_capture(cmd, &json) != 0 || !json) { free(json); return 0; }
+
+    long pid = 0;
+    int ok = json_get_int(json, "[0].pid", &pid);
+    free(json);
+
+    if (ok == 0 && pid > 0 && kill((pid_t)pid, 0) == 0) return (int)pid;
+    return 0;
+}
+
+/* PID of the current holder per grove, or 0. Filled in one pass so a request
+ * doesn't shell out to orchd more than once per model. */
+static void snapshot(int *pids) {
+    for (int i = 0; i < nmodels; i++) pids[i] = grove_pid(models[i].name);
+}
+
+static int active_from(const int *pids) {
     for (int i = 0; i < nmodels; i++)
-        if (http_ok(models[i].health)) return i;
+        if (pids[i] > 0) return i;
     return -1;
 }
 
@@ -273,14 +309,18 @@ static int switch_to(const char *name, int timeout, char *err, size_t errn) {
     int ti = find_model(name);
     if (ti < 0) { snprintf(err, errn, "unknown model"); return -2; }
 
-    if (http_ok(models[ti].health)) return models[ti].port;
+    /* Already the orchd holder and answering health? Nothing to do. */
+    if (grove_pid(models[ti].name) > 0 && http_ok(models[ti].health))
+        return models[ti].port;
 
-    /* Stop every other grove. Cheap and idempotent: a grove that was never
-     * planted is a no-op. */
+    /* orchd is the source of truth for who is running: fell every other grove
+     * that it reports as holding a live PID. Idempotent — a grove that was
+     * never grown just falls through. */
     for (int i = 0; i < nmodels; i++) {
         if (i == ti) continue;
-        if (http_ok(models[i].health)) {
-            logf_("stopping holder %s", models[i].name);
+        int pid = grove_pid(models[i].name);
+        if (pid > 0) {
+            logf_("stopping holder %s (pid %d)", models[i].name, pid);
             grove_fell(models[i].name);
         }
     }
@@ -378,23 +418,29 @@ static void handle(int fd) {
         if (strcmp(q, "/health") == 0) {
             send_all(fd, 200, "OK", "{\"ok\":true}");
         } else if (strcmp(q, "/state") == 0) {
-            int ai = active_index();
+            int pids[MAX_MODELS];
+            snapshot(pids);
+            int ai = active_from(pids);
             char out[256];
-            if (ai < 0) snprintf(out, sizeof out, "{\"active\":null,\"port\":null}");
+            if (ai < 0) snprintf(out, sizeof out, "{\"active\":null,\"port\":null,\"pid\":null}");
             else snprintf(out, sizeof out,
-                          "{\"active\":\"%s\",\"port\":%d}", models[ai].name, models[ai].port);
+                          "{\"active\":\"%s\",\"port\":%d,\"pid\":%d}",
+                          models[ai].name, models[ai].port, pids[ai]);
             send_all(fd, 200, "OK", out);
         } else if (strcmp(q, "/models") == 0) {
             sbuf_t s = {0};
-            int ai = active_index();
+            int pids[MAX_MODELS];
+            snapshot(pids);
+            int ai = active_from(pids);
             if (ai < 0) sb_add(&s, "{\"active\":null,\"models\":[");
             else sb_add(&s, "{\"active\":\"%s\",\"models\":[", models[ai].name);
             for (int i = 0; i < nmodels; i++) {
-                int up = http_ok(models[i].health);
+                int up = pids[i] > 0 && http_ok(models[i].health);
                 sb_add(&s, "%s{\"name\":\"%s\",\"port\":%d,\"file\":\"%s\","
-                           "\"health\":\"%s\",\"healthy\":%s}",
+                           "\"health\":\"%s\",\"pid\":%d,\"healthy\":%s}",
                        i ? "," : "", models[i].name, models[i].port,
-                       models[i].file, models[i].health, up ? "true" : "false");
+                       models[i].file, models[i].health, pids[i],
+                       up ? "true" : "false");
             }
             sb_add(&s, "]}");
             send_all(fd, 200, "OK", s.buf ? s.buf : "{}");
@@ -408,7 +454,7 @@ static void handle(int fd) {
     if (strcmp(method, "POST") == 0) {
         if (strcmp(q, "/stop") == 0) {
             for (int i = 0; i < nmodels; i++)
-                if (http_ok(models[i].health)) grove_fell(models[i].name);
+                if (grove_pid(models[i].name) > 0) grove_fell(models[i].name);
             send_all(fd, 200, "OK", "{\"ok\":true,\"stopped\":true}");
             return;
         }
