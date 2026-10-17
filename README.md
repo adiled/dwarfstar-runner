@@ -1,158 +1,65 @@
 # DwarfStar (ds4) model servers via `orchd`
 
-Five checkpoints, one GPU, one HTTP front door. Stock `orchd` 0.3.4 + a small
-C sidecar (`arbiter`) that raises whichever model a request names.
+Five model checkpoints share one GPU behind a single HTTP address. A client sends
+an OpenAI request to `http://127.0.0.1:8899/v1` and names the model it wants. A
+small C program called the arbiter decides which model holds the GPU, starts it
+when it is down, and forwards the request. Everything else runs on stock
+`orchd` 0.3.4.
 
-- **Target shape:** one grove per model + a controller grove for the arbiter.
-- **Why:** orchd `fell` tears down a whole state dir and there is no
-  per-service stop, so a grove has to *be* a service. See [Roadmap](#roadmap).
-
-## Layout
-
-```
-ds4-runner/
-├── run                                   # build + grow (the only entry point)
-├── arbiter.c  tinyjson.{c,h}  Makefile   # front door + switch engine
-├── .orchrc                               # scope=user
-├── arbiter.orch                          # grove "ctl"
-└── services/
-    ├── ds4server.orch                    # grove "ds4server"
-    ├── ds41server.orch
-    ├── ds4flash-q2.orch
-    ├── ds4flash-q2-legacy.orch
-    └── glm53server.orch
-```
-
-`services/` is the registry — the arbiter globs it and reads each spec via
-`orch parse`. No hard-coded roster.
-
-## Roster
-
-| Service | Model | Size | Port | `ENV MODELS` (advertised ids) |
-| --- | --- | ---: | ---: | --- |
-| `ds4server` | V4 Flash (fixed 0731) | 91 GiB | 8888 | `deepseek-v4-flash`, `deepseek-v4-pro` |
-| `ds41server` | V4.1 Flash Q2 | 341 GiB | 8887 | `deepseek-v4.1-flash` |
-| `ds4flash-q2` | V4 Flash IQ2XXS | 81 GiB | 8890 | `deepseek-v4-flash-iq2` |
-| `ds4flash-q2-legacy` | V4 Flash IQ2XXS (pre-0731) | 81 GiB | 8891 | `deepseek-v4-flash-iq2-legacy` |
-| `glm53server` | GLM 5.3 Flash Q2 | 90 GiB | 8889 | `glm-5.2`, `glm-5.2-chat`, `glm-5.2-reasoner` |
-| `arbiter` | (front door) | — | 8899 | — |
-
-## Run
+## How to use
 
 ```sh
-./run              # build if needed, then start the front door. That's it.
+./run      # start the front door
+./stop     # stop everything
 ```
 
-Then point a client at `http://127.0.0.1:8899/v1` and name a model. The front
-door owns the GPU from here on — it swaps the holder under a single lock, so
-models never collide. No per-model commands.
+Start once, then point any OpenAI client at `http://127.0.0.1:8899/v1` and name a
+model. That address is the only one a client needs to know. Models appear and
+disappear as requests arrive, so there are no per-model commands to run.
 
-```sh
-./run restart      # restart the front door (after changing specs or code)
-./run down         # stop everything: every model, then the front door
-```
+## How it works
 
-Power users drive `orchd` directly; the front door adds nothing to learn.
+Each model is described by a spec in `services/`. The arbiter reads that directory
+and parses every spec with `orch parse`, so the roster is whatever the files
+declare.
 
-## Specs
+The arbiter runs in its own grove. For each request it resolves the model name,
+asks `orchd survey` which grove holds the GPU, stops the other groves with
+`orchd fell`, starts the target with `orchd grow`, waits for the target's
+`HEALTHCHECK` to answer, and relays the request to that model's port. Response
+streams pass through unchanged, and every connection forks its own process so a
+long switch cannot hold up other clients.
 
-`.orchrc`: `scope=user`.
+The public interface is OpenAI's `/v1`. The `ENV MODELS` line in each spec lists
+the names its grove answers to.
 
-`arbiter.orch` (own grove):
-
-```dockerfile
-SERVICE arbiter
-RUN bash -c 'exec "${ORCH_PROJECT}/arbiter" --dir "${ORCH_PROJECT}" --orch ~/.local/bin/orch --orchd ~/.local/bin/orchd --listen 127.0.0.1:8899'
-HEALTHCHECK http://127.0.0.1:8899/v1/models
-RESTART always
-```
-
-`services/ds4server.orch` (one per model; the rest match):
-
-```dockerfile
-SERVICE ds4server
-RUN bash -c 'cd ~/projects/ds4 && exec nice -n 10 ~/projects/ds4/ds4-server --model ~/projects/ds4/gguf/<file>.gguf --host 0.0.0.0 --port 8888 --cors --ctx 100000 --ssd-streaming --kv-disk-dir ~/.ds4/server-kv --kv-disk-space-mb 16384 --batched-session 4 --threads 8'
-ENV DS4_LOCK_FILE=/tmp/ds4-gpu.lock
-ENV MODELS=deepseek-v4-flash,deepseek-v4-pro
-STDOUT /tmp/ds4-server.log
-STDERR /tmp/ds4-server.log
-HEALTHCHECK http://127.0.0.1:8888/v1/models
-RESTART no
-```
-
-- `RUN bash -c 'cd … && exec …'` — launchd won't expand `~` in a workdir;
-  `exec` keeps the PID.
-- `nice -n 10` — no `NICE` directive; rides the command line.
-- shared `DS4_LOCK_FILE` → single GPU holder.
-- `RESTART no` — lock losers `exit(2)` and must stay down.
-- `ENV MODELS` — names the front door advertises for this grove.
-
-## arbiter
-
-Its public surface is OpenAI's `/v1` — nothing else. A harness names a model;
-model lifecycle is not its concern.
-
-| Route | Purpose |
-| --- | --- |
-| `GET /v1/models` | every advertised id (also the grove's health probe) |
-| `POST /v1/chat/completions` | resolve `"model"` → raise the grove → relay the response verbatim |
-| any other `/v1/*` | same: resolve, raise, relay |
-
-Flags: `--dir --orch --orchd --state-root --listen --timeout --dump`.
-
-**Switch:** `orchd survey --json` per grove → live PID = holder; `fell` the
-others → `grow` target → poll `HEALTHCHECK` to 200. Fork-per-connection, so a
-switch or a stream never blocks the accept loop.
-
-**Client:** point at `http://127.0.0.1:8899/v1` once. `ENV MODELS` maps station
-names → groves. No side-channel call; the request's `"model"` *is* the switch.
-
-Lifecycle-only actions live in `./run` (`stop`, `status`), not the API.
-
-## Mutual exclusion
-
-`DS4_LOCK_FILE` = exclusive non-blocking `flock`. First process wins; later ones
-print `another ds4 process is already running (pid N); refusing to start` and
-`exit(2)`. All services share `/tmp/ds4-gpu.lock`; the file holds the holder PID.
-
-> Never pair a shared lock with `RESTART always` — losers `exit(2)` → boot loop.
-
-`DISABLED true` services aren't generated at all, so `grow <name>` can't start
-them. Omit the block instead.
-
-## Performance
-
-- **Resident when it fits.** ≤90 GiB (Q2 81 GiB, GLM 90 GiB) → drop
-  `--ssd-streaming`. 91 GiB / 341 GiB need it.
-- **`--batched-session` and speculation are exclusive.** For low single-stream
-  latency: drop batching, add `--dspark --mtp-model …DSpark-support-0731.gguf`
-  (V4 Flash) or `--mtp` (GLM; V4.1 has none).
-- **Leave the expert cache automatic** (~75% RAM); `--ssd-streaming-cache-experts`
-  oversize displaces resident weights. `--ssd-streaming-preload-experts N` is a knob.
-- **`--ctx` scales KV memory.** Drop `nice -n 10` for peak throughput.
+ds4 holds an exclusive lock on `DS4_LOCK_FILE`, and every spec points at the same
+file. One model can hold the GPU at a time, whichever way it was started. The
+arbiter stops the current model before it starts the next, which keeps the lock
+free during normal use.
 
 ## Roadmap
 
-Today: 5 model groves + `ctl`, and `arbiter`. End state: **one grove**, arbiter
-deleted. Three orchd gaps force the split; each closes one:
+The repository currently runs one grove per model plus a controller grove for the
+arbiter. The intended end state is a single grove that needs no arbiter. Three
+limitations in `orchd` 0.3.4 cause the split, and each one corresponds to a
+missing capability.
 
-| Today's constraint | Missing capability | Effect |
+| Limitation | Missing capability | Effect once it exists |
 | --- | --- | --- |
-| no stop-by-name; `fell` = whole state dir | per-service stop, native to the **`orchdi`** platform (pidfile-tracked leaves) | models can share a grove |
-| spec read once; edit needs `fell`+`grow` (launchd resurrects stale args) | **spec adoption** — reconcile the spec in place | one file = roster + selected model |
-| nothing declares two services mutually exclusive | **`EXCLUSIVE <resource>`** (+`PREEMPT`) | orchd does the GPU swap itself |
+| `fell` removes a whole state directory, and there is no way to stop one service | per-service stop in the `orchdi` platform, tracked by pidfile | models can share a single grove |
+| a spec is read once, so an edit needs `fell` and `grow` | spec adoption, which reconciles edits in place | one file can hold the roster and the selected model |
+| nothing states that two services cannot run together | an `EXCLUSIVE <resource>` directive with `PREEMPT` | `orchd` performs the GPU swap itself |
 
-Then `services/*.orch` merges into one file and `arbiter.c` goes away:
+With those in place the specs merge into a single file and the arbiter goes away:
 
 ```dockerfile
 SERVICE glm53server
-RUN … --port 8889 …
+RUN ... --port 8889 ...
 EXCLUSIVE gpu
 PREEMPT ds4server
 ```
 
-switch = `orchd --platform orchdi grow glm53server`.
-
-Not in 0.3.4: no `EXCLUSIVE`/`PREEMPT` directive, no `stop` subcommand,
-`clean()` removes the whole state dir. The arbiter is a hand-rolled version of
-this loop: grove = service, `fell` = stop, `flock` = exclusive slot.
+A switch then becomes `orchd --platform orchdi grow glm53server`. The arbiter is a
+hand-rolled version of this loop: a grove stands in for the service, `fell` stands
+in for the stop, and the lock stands in for the exclusive slot.
