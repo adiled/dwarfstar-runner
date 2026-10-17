@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <glob.h>
 #include <limits.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -53,6 +54,7 @@
 typedef struct {
     char name[128];
     char file[PATH_MAX];
+    char host[256];
     int  port;
     char health[512];
     char ids[1024];   /* comma-separated model ids this grove answers to */
@@ -68,6 +70,9 @@ static char g_state_root[PATH_MAX];
 static char g_listen_host[128] = "127.0.0.1";
 static int  g_listen_port = 8899;
 static int  g_timeout = 900;
+
+static int parse_url(const char *url, char *host, size_t hostn,
+                     int *port, char *path, size_t pathn);
 
 static void logf_(const char *fmt, ...) {
     char ts[32];
@@ -164,12 +169,25 @@ static int discover(char *err, size_t errn) {
         model_t *m = &models[nmodels++];
         snprintf(m->name, sizeof m->name, "%s", name);
         snprintf(m->file, sizeof m->file, "%s", file);
+        snprintf(m->host, sizeof m->host, "127.0.0.1");
         m->port = port_from_cmd(run);
-        if (hc && hc[0])
+
+        if (hc && hc[0]) {
             snprintf(m->health, sizeof m->health, "%s", hc);
-        else
+            /* The health URL carries the address the server answers on, so it
+             * takes precedence over the port scraped from the run command. */
+            char hpath[512];
+            int hport = 0;
+            if (parse_url(hc, m->host, sizeof m->host, &hport, hpath, sizeof hpath) == 0) {
+                if (hport > 0) m->port = hport;
+            } else {
+                logf_("%s: health URL is not plain HTTP, falling back to %s:%d",
+                      name, m->host, m->port);
+            }
+        } else {
             snprintf(m->health, sizeof m->health,
-                     "http://127.0.0.1:%d/v1/models", m->port);
+                     "http://%s:%d/v1/models", m->host, m->port);
+        }
         /* Model ids the front door advertises for this grove: ENV MODELS if
          * set, else the service name. */
         snprintf(m->ids, sizeof m->ids, "%s", (ids && ids[0]) ? ids : name);
@@ -185,39 +203,75 @@ static int discover(char *err, size_t errn) {
     return 0;
 }
 
-/* GET the health URL and report whether it answers 200. */
-static int http_ok(const char *url) {
-    char host[256] = "127.0.0.1", path[512] = "/";
-    int port = 80;
-
+/* Split "http://host:port/path" into host, port and path. A bare
+ * "host:port/path" is accepted too, and an IPv6 literal may be bracketed.
+ * Returns 0 on success and -1 for a scheme the arbiter cannot speak. */
+static int parse_url(const char *url, char *host, size_t hostn,
+                     int *port, char *path, size_t pathn) {
     const char *p = url;
     if (strncmp(p, "http://", 7) == 0) p += 7;
+    else if (strncmp(p, "https://", 8) == 0) return -1;
+
     const char *slash = strchr(p, '/');
-    char hostport[300];
+    char hostport[512];
     if (slash) {
         snprintf(hostport, sizeof hostport, "%.*s", (int)(slash - p), p);
-        snprintf(path, sizeof path, "%s", slash);
+        snprintf(path, pathn, "%s", slash);
     } else {
         snprintf(hostport, sizeof hostport, "%s", p);
+        snprintf(path, pathn, "/");
     }
-    char *colon = strrchr(hostport, ':');
-    if (colon) { *colon = '\0'; port = atoi(colon + 1); }
-    snprintf(host, sizeof host, "%s", hostport);
 
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    *port = 80;
+    if (hostport[0] == '[') {
+        char *rb = strchr(hostport, ']');
+        if (!rb) return -1;
+        *rb = '\0';
+        snprintf(host, hostn, "%s", hostport + 1);
+        if (rb[1] == ':') *port = atoi(rb + 2);
+    } else {
+        char *colon = strrchr(hostport, ':');
+        if (colon) { *colon = '\0'; *port = atoi(colon + 1); }
+        snprintf(host, hostn, "%s", hostport);
+    }
+    return 0;
+}
+
+/* Open a TCP connection to host:port. Names, IPv4 and IPv6 all work. */
+static int dial(const char *host, int port) {
+    char service[16];
+    snprintf(service, sizeof service, "%d", port);
+
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, service, &hints, &res) != 0) return -1;
+
+    int fd = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(res);
+    return fd;
+}
+
+/* GET the health URL and report whether it answers 200. */
+static int http_ok(const char *url) {
+    char host[256], path[512];
+    int port;
+    if (parse_url(url, host, sizeof host, &port, path, sizeof path) != 0) return 0;
+
+    int fd = dial(host, port);
     if (fd < 0) return 0;
-
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons((uint16_t)port);
-    sa.sin_addr.s_addr = inet_addr(host);
 
     struct timeval tv = {2, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-
-    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) { close(fd); return 0; }
 
     char req[1024];
     int n = snprintf(req, sizeof req,
@@ -353,23 +407,11 @@ static int find_by_model_id(const char *id) {
     return -1;
 }
 
-static int connect_backend(int port) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons((uint16_t)port);
-    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
-    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) { close(fd); return -1; }
-    return fd;
-}
-
 /* Forward an inference request to the resolved grove and relay the response
  * verbatim (status line, headers and body — streaming included). */
 static void proxy_to(int cfd, int ti, const char *path,
                      const char *body, long clen) {
-    int bfd = connect_backend(models[ti].port);
+    int bfd = dial(models[ti].host, models[ti].port);
     if (bfd < 0) {
         send_all(cfd, 502, "Bad Gateway", "{\"error\":\"backend unreachable\"}");
         return;
@@ -377,10 +419,10 @@ static void proxy_to(int cfd, int ti, const char *path,
 
     char hdr[1024];
     int n = snprintf(hdr, sizeof hdr,
-                     "POST %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+                     "POST %s HTTP/1.1\r\nHost: %s:%d\r\n"
                      "Content-Type: application/json\r\nContent-Length: %ld\r\n"
                      "Connection: close\r\n\r\n",
-                     path, models[ti].port, clen);
+                     path, models[ti].host, models[ti].port, clen);
     if (write(bfd, hdr, (size_t)n) < 0) { close(bfd); return; }
     if (body && clen > 0) {
         long sent = 0;
@@ -568,18 +610,33 @@ static void dispatch(int fd, const char *method, const char *path,
 }
 
 static int serve(void) {
-    int lfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (lfd < 0) { logf_("socket: %s", strerror(errno)); return 1; }
-    int one = 1;
-    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    char service[16];
+    snprintf(service, sizeof service, "%d", g_listen_port);
 
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons((uint16_t)g_listen_port);
-    sa.sin_addr.s_addr = inet_addr(g_listen_host);
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    int gai = getaddrinfo(g_listen_host[0] ? g_listen_host : NULL,
+                          service, &hints, &res);
+    if (gai != 0) {
+        logf_("listen %s:%d: %s", g_listen_host, g_listen_port, gai_strerror(gai));
+        return 1;
+    }
 
-    if (bind(lfd, (struct sockaddr *)&sa, sizeof sa) != 0) {
+    int lfd = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        lfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (lfd < 0) continue;
+        int one = 1;
+        setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        if (bind(lfd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        close(lfd);
+        lfd = -1;
+    }
+    freeaddrinfo(res);
+    if (lfd < 0) {
         logf_("bind %s:%d: %s", g_listen_host, g_listen_port, strerror(errno));
         return 1;
     }
@@ -631,9 +688,18 @@ int main(int argc, char **argv) {
     if (v) {
         char tmp[256];
         snprintf(tmp, sizeof tmp, "%s", v);
-        char *colon = strrchr(tmp, ':');
-        if (colon) { *colon = '\0'; g_listen_port = atoi(colon + 1);
-                     snprintf(g_listen_host, sizeof g_listen_host, "%s", tmp); }
+        if (tmp[0] == '[') {
+            char *rb = strchr(tmp, ']');
+            if (rb) {
+                *rb = '\0';
+                snprintf(g_listen_host, sizeof g_listen_host, "%s", tmp + 1);
+                if (rb[1] == ':') g_listen_port = atoi(rb + 2);
+            }
+        } else {
+            char *colon = strrchr(tmp, ':');
+            if (colon) { *colon = '\0'; g_listen_port = atoi(colon + 1);
+                         snprintf(g_listen_host, sizeof g_listen_host, "%s", tmp); }
+        }
     }
     v = arg_val(argc, argv, "--timeout");
     if (v) g_timeout = atoi(v);
