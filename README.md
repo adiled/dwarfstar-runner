@@ -15,11 +15,16 @@ when it is down, and forwards the request. Everything else runs on stock
 
 The front door reads its roster from `servers/`. The repository ships examples in
 `servers-template/`, and on a fresh clone `servers/` is empty, so `./run` will
-exit with `no specs matched`. Copy what you need, or symlink it in from wherever
-you keep it:
+exit with `no specs matched`. Link every template in, or copy the ones you want:
 
 ```sh
+for f in servers-template/*.orch; do ln -s "../$f" servers/; done
 cp servers-template/ds4server.orch servers/
+```
+
+Or bring in an Orchfile you keep elsewhere:
+
+```sh
 ln -s ~/my-models/llama.orch servers/llama.orch
 ```
 
