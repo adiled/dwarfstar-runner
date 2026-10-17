@@ -3,6 +3,7 @@ ORCH_VERSION 1.0.0-rc
 SERVICE glm53server
 RUN bash -c 'cd ~/projects/ds4 && exec nice -n 10 ~/projects/ds4/ds4-server --model ~/projects/ds4/gguf/GLM-5.3-Flash-Q2.gguf --host 0.0.0.0 --port 8889 --cors --backend metal --ctx 32768 --ssd-streaming --batched-session 4 --threads 8'
 ENV DS4_LOCK_FILE=/tmp/ds4-gpu.lock
+ENV MODELS=glm-5.2,glm-5.2-chat,glm-5.2-reasoner
 STDOUT /tmp/ds4-glm53.log
 STDERR /tmp/ds4-glm53.log
 HEALTHCHECK http://127.0.0.1:8889/v1/models

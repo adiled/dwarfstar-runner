@@ -163,12 +163,50 @@ Apps never kill processes. They ask the arbiter on `127.0.0.1:8899`.
 | `GET /models` | each model + its orchd `pid` + `healthy`, plus the active one |
 | `POST /use/<name>` (or `/use` `{"model":"…"}`) | switch; blocks until ready |
 | `POST /stop` | stop every model grove |
+| `GET /v1/models` · `POST /v1/chat/completions` | OpenAI front door (below) |
 
 ```sh
 curl -s http://127.0.0.1:8899/state
 curl -s -X POST http://127.0.0.1:8899/use/glm53server
 curl -s -X POST 'http://127.0.0.1:8899/use/ds41server?timeout=1800'
 ```
+
+### The `/v1` front door — no more `/use`
+
+Point any OpenAI-compatible client at `http://127.0.0.1:8899/v1` once and it
+never has to know which model is loaded:
+
+| Route | Behaviour |
+| --- | --- |
+| `GET /v1/models` | every name any grove answers to (`ENV MODELS`), unioned |
+| `POST /v1/chat/completions` | read `"model"` → resolve the grove → raise it if needed → stream the backend response straight through |
+
+So a client just asks for a model and the arbiter makes it so. A grove declares
+the names it serves:
+
+```dockerfile
+SERVICE glm53server
+RUN … --port 8889 …
+ENV MODELS=glm-5.2,glm-5.2-chat,glm-5.2-reasoner
+```
+
+The request path is fork-per-connection, so a switch (minutes) or a streaming
+response (seconds) never blocks the accept loop. `/use` still exists for a
+direct nudge, but normal clients never call it — they name a model and the
+front door raises it.
+
+```toml
+# ~/.config/wryme/shops.toml — one shop for every local model
+[[shop]]
+name = "local"
+url = "http://127.0.0.1:8899/v1"
+protocol = "chat-completions"
+```
+
+Then `wme --station glm-5.2 -p …` and `wme --station deepseek-v4-flash -p …`
+each raise their model on demand, no `/use` in between.
+
+### A switch, step by step
 
 A switch (`switch_to` in `arbiter.c`):
 

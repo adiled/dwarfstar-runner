@@ -59,6 +59,7 @@ typedef struct {
     char file[PATH_MAX];
     int  port;
     char health[512];
+    char ids[1024];   /* comma-separated model ids this grove answers to */
 } model_t;
 
 static model_t models[MAX_MODELS];
@@ -159,9 +160,10 @@ static int discover(char *err, size_t errn) {
         char *name = json_get_string(json, "services[0].name");
         char *run  = json_get_string(json, "services[0].run_command");
         char *hc   = json_get_string(json, "services[0].healthcheck");
+        char *ids  = json_get_string(json, "services[0].env.MODELS");
         free(json);
 
-        if (!name || !run) { free(name); free(run); free(hc); continue; }
+        if (!name || !run) { free(name); free(run); free(hc); free(ids); continue; }
 
         model_t *m = &models[nmodels++];
         snprintf(m->name, sizeof m->name, "%s", name);
@@ -172,8 +174,11 @@ static int discover(char *err, size_t errn) {
         else
             snprintf(m->health, sizeof m->health,
                      "http://127.0.0.1:%d/v1/models", m->port);
+        /* Model ids the front door advertises for this grove: ENV MODELS if
+         * set, else the service name. */
+        snprintf(m->ids, sizeof m->ids, "%s", (ids && ids[0]) ? ids : name);
 
-        free(name); free(run); free(hc);
+        free(name); free(run); free(hc); free(ids);
     }
     globfree(&gl);
 
@@ -342,6 +347,82 @@ static int switch_to(const char *name, int timeout, char *err, size_t errn) {
 
 /* --- HTTP --------------------------------------------------------------- */
 
+/* --- /v1 front door ----------------------------------------------------- */
+
+static void send_all(int fd, int code, const char *reason, const char *body);
+static void dispatch(int fd, const char *method, const char *path,
+                     char *body, long clen, int timeout);
+
+/* Resolve a requested model id to a grove, honouring each grove's ENV MODELS. */
+static int find_by_model_id(const char *id) {
+    size_t idl = strlen(id);
+    for (int i = 0; i < nmodels; i++) {
+        const char *p = models[i].ids;
+        while (*p) {
+            const char *c = strchr(p, ',');
+            size_t tl = c ? (size_t)(c - p) : strlen(p);
+            if (tl == idl && strncmp(p, id, tl) == 0) return i;
+            if (!c) break;
+            p = c + 1;
+        }
+    }
+    return -1;
+}
+
+static int connect_backend(int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((uint16_t)port);
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) { close(fd); return -1; }
+    return fd;
+}
+
+/* Forward an inference request to the resolved grove and relay the response
+ * verbatim (status line, headers and body — streaming included). */
+static void proxy_to(int cfd, int ti, const char *path,
+                     const char *body, long clen) {
+    int bfd = connect_backend(models[ti].port);
+    if (bfd < 0) {
+        send_all(cfd, 502, "Bad Gateway", "{\"error\":\"backend unreachable\"}");
+        return;
+    }
+
+    char hdr[1024];
+    int n = snprintf(hdr, sizeof hdr,
+                     "POST %s HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+                     "Content-Type: application/json\r\nContent-Length: %ld\r\n"
+                     "Connection: close\r\n\r\n",
+                     path, models[ti].port, clen);
+    if (write(bfd, hdr, (size_t)n) < 0) { close(bfd); return; }
+    if (body && clen > 0) {
+        long sent = 0;
+        while (sent < clen) {
+            ssize_t w = write(bfd, body + sent, (size_t)(clen - sent));
+            if (w <= 0) break;
+            sent += w;
+        }
+    }
+
+    char rbuf[65536];
+    for (;;) {
+        ssize_t r = read(bfd, rbuf, sizeof rbuf);
+        if (r <= 0) break;
+        ssize_t off = 0;
+        while (off < r) {
+            ssize_t w = write(cfd, rbuf + off, (size_t)(r - off));
+            if (w <= 0) { close(bfd); return; }
+            off += w;
+        }
+    }
+    close(bfd);
+}
+
+/* --- HTTP --------------------------------------------------------------- */
+
 typedef struct { char *buf; size_t len, cap; } sbuf_t;
 
 static void sb_add(sbuf_t *s, const char *fmt, ...) {
@@ -376,43 +457,67 @@ static char *find_ci(const char *hay, const char *needle) {
 }
 
 static void handle(int fd) {
-    char buf[RECV_MAX];
-    size_t len = 0;
-    for (;;) {
-        ssize_t r = read(fd, buf + len, sizeof buf - 1 - len);
-        if (r <= 0) break;
+    /* Grow a buffer: headers first, then the declared body. Big prompts are
+     * common on /v1, so this can't be a fixed stack buffer. */
+    size_t cap = 65536, len = 0;
+    char *buf = malloc(cap);
+    if (!buf) return;
+
+    char *he = NULL;
+    while (!he) {
+        if (len + 1 >= cap) {
+            cap *= 2;
+            char *t = realloc(buf, cap);
+            if (!t) { free(buf); return; }
+            buf = t;
+        }
+        ssize_t r = read(fd, buf + len, cap - len - 1);
+        if (r <= 0) { free(buf); return; }
         len += (size_t)r;
         buf[len] = '\0';
-        if (strstr(buf, "\r\n\r\n")) break;
+        he = strstr(buf, "\r\n\r\n");
     }
-    if (len == 0) return;
 
-    char method[8] = {0}, path[512] = {0};
-    sscanf(buf, "%7s %511s", method, path);
+    char method[8] = {0}, path[1024] = {0};
+    sscanf(buf, "%7s %1023s", method, path);
 
     long clen = 0;
     char *cl = find_ci(buf, "content-length:");
     if (cl) clen = atol(cl + 15);
+    if (clen < 0) clen = 0;
 
-    char *body = strstr(buf, "\r\n\r\n");
-    body = body ? body + 4 : buf + len;
-    /* read any remaining body */
-    while (clen > 0 && (long)(len - (size_t)(body - buf)) < clen) {
-        ssize_t r = read(fd, buf + len, sizeof buf - 1 - len);
+    size_t hdr_len = (size_t)(he - buf) + 4;
+    size_t need = hdr_len + (size_t)clen;
+    while (len < need) {
+        if (need + 1 > cap) {
+            cap = need + 1;
+            char *t = realloc(buf, cap);
+            if (!t) { free(buf); return; }
+            buf = t;
+        }
+        ssize_t r = read(fd, buf + len, cap - len - 1);
         if (r <= 0) break;
         len += (size_t)r;
         buf[len] = '\0';
     }
 
+    int timeout = g_timeout;
+    const char *qs = strchr(path, '?');
+    if (qs) {
+        const char *t = strstr(qs + 1, "timeout=");
+        if (t) { int v = atoi(t + 8); if (v > 0) timeout = v; }
+    }
+
+    dispatch(fd, method, path, buf + hdr_len, clen, timeout);
+    free(buf);
+}
+
+static void dispatch(int fd, const char *method, const char *path,
+                     char *body, long clen, int timeout) {
     char q[512];
     snprintf(q, sizeof q, "%s", path);
     char *qs = strchr(q, '?');
-    int timeout = g_timeout;
-    if (qs) {
-        *qs = '\0';
-        char *t = strstr(qs + 1, "timeout=");
-        if (t) { int v = atoi(t + 8); if (v > 0) timeout = v; }
-    }
+    if (qs) *qs = '\0';
 
     if (strcmp(method, "GET") == 0) {
         if (strcmp(q, "/health") == 0) {
@@ -444,6 +549,27 @@ static void handle(int fd) {
             }
             sb_add(&s, "]}");
             send_all(fd, 200, "OK", s.buf ? s.buf : "{}");
+            free(s.buf);
+        } else if (strcmp(q, "/v1/models") == 0) {
+            /* Advertise every name any grove answers to, so a client can ask
+             * for one and let the front door raise it. */
+            sbuf_t s = {0};
+            sb_add(&s, "{\"object\":\"list\",\"data\":[");
+            int first = 1;
+            for (int i = 0; i < nmodels; i++) {
+                char tmp[1024];
+                snprintf(tmp, sizeof tmp, "%s", models[i].ids);
+                for (char *tok = strtok(tmp, ","); tok; tok = strtok(NULL, ","))
+                    if (tok[0]) {
+                        sb_add(&s, "%s{\"id\":\"%s\",\"object\":\"model\","
+                                   "\"owned_by\":\"ds4\"}",
+                               first ? "" : ",", tok);
+                        first = 0;
+                    }
+            }
+            sb_add(&s, "]}");
+            send_all(fd, 200, "OK",
+                     s.buf ? s.buf : "{\"object\":\"list\",\"data\":[]}");
             free(s.buf);
         } else {
             send_all(fd, 404, "Not Found", "{\"error\":\"not found\"}");
@@ -486,6 +612,39 @@ static void handle(int fd) {
             }
             return;
         }
+        if (strncmp(q, "/v1/", 4) == 0) {
+            /* Inference front door: read the requested model, raise its grove
+             * if needed, then stream the backend's response back verbatim. */
+            char *mid = (body && clen > 0) ? json_get_string(body, "model") : NULL;
+            if (!mid) {
+                send_all(fd, 400, "Bad Request", "{\"error\":\"missing model\"}");
+                return;
+            }
+            int ti = find_by_model_id(mid);
+            if (ti < 0) {
+                char out[320];
+                snprintf(out, sizeof out,
+                         "{\"error\":\"unknown model\",\"model\":\"%s\"}", mid);
+                send_all(fd, 404, "Not Found", out);
+                free(mid);
+                return;
+            }
+            free(mid);
+
+            if (!(grove_pid(models[ti].name) > 0 && http_ok(models[ti].health))) {
+                char err[256] = {0};
+                logf_("/v1 wants %s -> switching", models[ti].name);
+                if (switch_to(models[ti].name, timeout, err, sizeof err) < 0) {
+                    char out[320];
+                    snprintf(out, sizeof out, "{\"error\":\"%s\"}", err);
+                    send_all(fd, 503, "Service Unavailable", out);
+                    return;
+                }
+            }
+            logf_("/v1 %s -> :%d", q, models[ti].port);
+            proxy_to(fd, ti, path, body, clen);
+            return;
+        }
     }
 
     send_all(fd, 404, "Not Found", "{\"error\":\"not found\"}");
@@ -516,10 +675,21 @@ static int serve(void) {
         logf_("  %-22s :%-6d %s", models[i].name, models[i].port, models[i].health);
 
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN);   /* reap forked connections automatically */
     for (;;) {
         int fd = accept(lfd, NULL, NULL);
         if (fd < 0) { if (errno == EINTR) continue; break; }
-        handle(fd);
+
+        /* Fork per connection: a switch can block for minutes and an
+         * inference response streams for many seconds; the accept loop must
+         * stay free. The child owns the socket. */
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(lfd);
+            handle(fd);
+            close(fd);
+            _exit(0);
+        }
         close(fd);
     }
     close(lfd);
