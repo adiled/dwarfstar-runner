@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""DwarfStar GPU arbiter.
+
+A tiny always-on sidecar that lets an end-harness switch which ds4 model is
+serving *without ever killing a process by hand*. It is the only long-lived
+service; the models themselves share one `DS4_LOCK_FILE`, so at most one of
+them runs at a time.
+
+    harness ──HTTP──> arbiter ──┬─ launchctl bootout  <current holder>
+                                └─ orchd --user grow  <target>
+
+The GPU "volley" is passed by process exit releasing the flock; the arbiter is
+the broker that stops the current holder, starts the requested one, and only
+returns once the target answers its healthcheck.
+
+The arbiter is a *derivative* of the spec, never a second copy of it: it reads
+./Orchfile (SERVICE names, ports from RUN, HEALTHCHECK) and ./.orchrc
+(namespace) at startup. Change the Orchfile and the arbiter follows — there is
+no roster to keep in sync here.
+
+This is a stand-in for what `orchdi` will do natively once the Orch spec grows
+an exclusive/singleton slot (see README, "Letting orchdi replace this"). No
+orchd code is required to use it.
+
+Endpoints
+    GET  /health          -> {"ok": true}
+    GET  /state           -> {"active": "<name>"|null, "port": <int>|null}
+    GET  /models          -> every model with running/healthy flags
+    POST /use             body {"model": "<name>"} [or POST /use/<name>]
+                          [?timeout=<sec>] -> switches and blocks until ready
+    POST /stop            -> boots out every model (arbiter stays up)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+UID = os.getuid()
+DOMAIN = f"gui/{UID}"
+HOME = os.path.expanduser("~")
+LAUNCH_AGENTS = os.path.join(HOME, "Library", "LaunchAgents")
+
+DEFAULT_HEALTH = "/v1/models"
+PORT_RE = re.compile(r"--port[=\s]+(\d+)")
+ENV_RE = re.compile(r"DS4_LOCK_FILE[=\s]+(\S+)")
+
+
+# ---------------------------------------------------------------------------
+# Spec reading: the Orchfile is declarative; the arbiter only interprets it.
+# ---------------------------------------------------------------------------
+def read_namespace(orchdir: str, fallback: str = "com.dwarfstar") -> str:
+    rc = os.path.join(orchdir, ".orchrc")
+    try:
+        with open(rc) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                if key.strip() == "namespace":
+                    return val.strip()
+    except FileNotFoundError:
+        pass
+    return fallback
+
+
+def read_orchfile(path: str) -> dict:
+    """Parse SERVICE blocks into {name: {port, health, lock}}.
+
+    Deliberately small: it reads only what the arbiter needs, and treats the
+    Orchfile as read-only truth rather than duplicating service definitions.
+    """
+    models: dict = {}
+    name = None
+    with open(path) as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            head = line.split(None, 1)[0].upper()
+            if head == "SERVICE":
+                name = line.split(None, 1)[1].strip()
+                models[name] = {"port": None, "health": DEFAULT_HEALTH, "lock": None}
+            elif head == "RUN" and name:
+                m = PORT_RE.search(line)
+                if m:
+                    models[name]["port"] = int(m.group(1))
+                lm = ENV_RE.search(line)
+                if lm:
+                    models[name]["lock"] = lm.group(1)
+            elif head == "ENV" and name:
+                lm = ENV_RE.search(line)
+                if lm:
+                    models[name]["lock"] = lm.group(1)
+            elif head == "HEALTHCHECK" and name:
+                val = line.split(None, 1)[1].strip()
+                if val.startswith("http"):
+                    models[name]["health"] = val
+                else:
+                    models[name]["health"] = None  # shell command, not a URL
+    return {n: m for n, m in models.items() if m["port"]}
+
+
+def load_spec(orchdir: str, orchfile: str):
+    path = orchfile if os.path.isabs(orchfile) else os.path.join(orchdir, orchfile)
+    models = read_orchfile(path)
+    if not models:
+        sys.exit(f"arbiter: no SERVICE blocks with a --port found in {path}")
+    return read_namespace(orchdir), models
+
+
+class Arbiter:
+    def __init__(self, models, prefix, orchdir, orchfile, orchd, default_timeout):
+        self.models = models
+        self.prefix = prefix
+        self.orchdir = orchdir
+        self.orchfile = orchfile
+        self.orchd = orchd
+        self.default_timeout = default_timeout
+        self.lock = threading.Lock()
+
+    def port(self, name: str) -> int:
+        return self.models[name]["port"]
+
+    def health_url(self, name: str) -> str:
+        hc = self.models[name]["health"]
+        if hc and hc.startswith("http"):
+            return hc
+        return f"http://127.0.0.1:{self.port(name)}{DEFAULT_HEALTH}"
+
+    # -- launchd plumbing ---------------------------------------------------
+    def label(self, name: str) -> str:
+        return f"{self.prefix}.{name}"
+
+    def plist(self, name: str) -> str:
+        return os.path.join(LAUNCH_AGENTS, f"{self.label(name)}.plist")
+
+    def _run(self, args, cwd=None):
+        return subprocess.run(args, capture_output=True, text=True, cwd=cwd)
+
+    def is_running(self, name: str) -> bool:
+        r = self._run(["launchctl", "print", f"{DOMAIN}/{self.label(name)}"])
+        if r.returncode != 0:
+            return False
+        for line in r.stdout.splitlines():
+            t = line.strip()
+            if t.startswith("state ="):
+                return t.split("=", 1)[1].strip().rstrip(",") == "running"
+        return False
+
+    def stop(self, name: str) -> None:
+        self._run(["launchctl", "bootout", DOMAIN, self.plist(name)])
+        deadline = time.time() + 60
+        while time.time() < deadline and self.is_running(name):
+            time.sleep(0.25)
+
+    def start(self, name: str) -> None:
+        plist = self.plist(name)
+        label = self.label(name)
+        r = self._run(["launchctl", "bootstrap", DOMAIN, plist])
+        if r.returncode != 0:  # already loaded -> kick it instead
+            self._run(["launchctl", "kickstart", "-k", f"{DOMAIN}/{label}"])
+
+    def ensure_installed(self, name: str) -> bool:
+        if os.path.exists(self.plist(name)):
+            return True
+        # Not generated yet: ask orchd to lay it down from the same Orchfile.
+        log(f"{name}: no plist; running `{self.orchd} --user grow {name}`")
+        self._run([self.orchd, "--user", "grow", name], cwd=self.orchdir)
+        return os.path.exists(self.plist(name))
+
+    # -- health -------------------------------------------------------------
+    def healthy(self, name: str) -> bool:
+        try:
+            with urllib.request.urlopen(self.health_url(name), timeout=2) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
+    def running_models(self):
+        return [n for n in self.models if self.is_running(n)]
+
+    def active(self):
+        for n in self.models:
+            if self.is_running(n) and self.healthy(n):
+                return n
+        return None
+
+    # -- the volley ---------------------------------------------------------
+    def switch(self, target: str, timeout: float) -> int:
+        if target not in self.models:
+            raise KeyError(target)
+        with self.lock:
+            if self.is_running(target) and self.healthy(target):
+                log(f"{target}: already serving :{self.port(target)}")
+                return self.port(target)
+
+            if not self.ensure_installed(target):
+                raise RuntimeError(
+                    f"{target}: plist not installed; run `orchd --user grow {target}`"
+                )
+
+            for name in self.running_models():
+                if name != target:
+                    log(f"stopping holder {name}")
+                    self.stop(name)
+
+            log(f"starting {target}")
+            self.start(target)
+
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if self.healthy(target):
+                    log(f"{target}: ready on :{self.port(target)}")
+                    return self.port(target)
+                if not self.is_running(target):
+                    time.sleep(1.0)
+                    if not self.is_running(target):
+                        raise RuntimeError(
+                            f"{target} exited before becoming ready "
+                            f"(shared lock contention? see its log)"
+                        )
+                time.sleep(0.5)
+            raise TimeoutError(f"{target} not ready within {int(timeout)}s")
+
+
+class Handler(BaseHTTPRequestHandler):
+    arbiter: Arbiter = None  # set by serve()
+
+    def log_message(self, fmt, *args):
+        log(f"{self.address_string()} {fmt % args}")
+
+    def _send(self, code, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _models_view(self):
+        a = self.arbiter
+        return {
+            "active": a.active(),
+            "models": [
+                {
+                    "name": n,
+                    "port": a.port(n),
+                    "label": a.label(n),
+                    "health": a.health_url(n),
+                    "running": a.is_running(n),
+                    "healthy": a.healthy(n),
+                }
+                for n in a.models
+            ],
+        }
+
+    def do_GET(self):
+        a = self.arbiter
+        if self.path == "/health":
+            return self._send(200, {"ok": True})
+        if self.path == "/state":
+            active = a.active()
+            return self._send(
+                200,
+                {"active": active, "port": a.port(active) if active else None},
+            )
+        if self.path == "/models":
+            return self._send(200, self._models_view())
+        return self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        a = self.arbiter
+        path, _, query = self.path.partition("?")
+        params = dict(
+            (k, v) for k, v in (p.split("=", 1) for p in query.split("&") if "=" in p)
+        )
+        timeout = float(params.get("timeout", a.default_timeout))
+
+        if path == "/stop":
+            with a.lock:
+                for n in a.running_models():
+                    a.stop(n)
+            return self._send(200, {"ok": True, "stopped": True})
+
+        if path == "/use" or path.startswith("/use/"):
+            if path.startswith("/use/"):
+                target = path[len("/use/") :]
+            else:
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length else b"{}"
+                try:
+                    target = json.loads(raw or b"{}").get("model", "")
+                except json.JSONDecodeError:
+                    return self._send(400, {"error": "invalid JSON body"})
+            if not target:
+                return self._send(400, {"error": "missing model"})
+            try:
+                port = a.switch(target, timeout)
+            except KeyError:
+                return self._send(
+                    404, {"error": "unknown model", "models": sorted(a.models)}
+                )
+            except TimeoutError as e:
+                return self._send(503, {"error": str(e)})
+            except RuntimeError as e:
+                return self._send(503, {"error": str(e)})
+            return self._send(200, {"ok": True, "model": target, "port": port})
+
+        return self._send(404, {"error": "not found"})
+
+
+def main():
+    ap = argparse.ArgumentParser(description="DwarfStar GPU arbiter")
+    ap.add_argument("--listen", default="127.0.0.1:8899", help="host:port")
+    ap.add_argument("--orchdir", default=os.path.dirname(os.path.abspath(__file__)))
+    ap.add_argument("--orchfile", default="Orchfile", help="spec, relative to --orchdir")
+    ap.add_argument("--orchd", default="orchd")
+    ap.add_argument("--timeout", type=float, default=900.0, help="load timeout, secs")
+    args = ap.parse_args()
+
+    host, _, port = args.listen.partition(":")
+    prefix, models = load_spec(args.orchdir, args.orchfile)
+    Handler.arbiter = Arbiter(
+        models, prefix, args.orchdir, args.orchfile, args.orchd, args.timeout
+    )
+
+    srv = ThreadingHTTPServer((host, int(port)), Handler)
+    log(f"arbiter on http://{host}:{port}")
+    log(f"spec {os.path.join(args.orchdir, args.orchfile)} -> prefix {prefix}")
+    for n in models:
+        log(f"  {n:<22} :{models[n]['port']:<6} {Handler.arbiter.health_url(n)}")
+
+    locks = {m["lock"] for m in models.values() if m["lock"]}
+    if len(locks) > 1:
+        log(
+            "WARNING: models do not share one DS4_LOCK_FILE "
+            f"({len(locks)} distinct); the GPU is not mutually exclusive in the "
+            "kernel — exclusivity rests on this arbiter alone. Point every "
+            "SERVICE at one lock to enforce it in ds4 too."
+        )
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+
+
+if __name__ == "__main__":
+    main()
