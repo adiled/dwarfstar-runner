@@ -43,20 +43,16 @@ ds4-runner/
 ./run              # build if needed, then start the front door. That's it.
 ```
 
-Then point a client at `http://127.0.0.1:8899/v1` and name a model. Models are
-raised on demand — no per-model step in normal use.
+Then point a client at `http://127.0.0.1:8899/v1` and name a model. The front
+door owns the GPU from here on — it swaps the holder under a single lock, so
+models never collide. No per-model commands.
 
 ```sh
 ./run restart      # restart the front door (after changing specs or code)
-./run stop         # unload every model, freeing the GPU
-./run status       # list each model and whether it is running
-./run down         # stop the front door
-./run glm53server grow          # manual: start just that model
-./run ds4server fell            # manual: stop just that model
+./run down         # stop everything: every model, then the front door
 ```
 
-`./run` just wraps a long `orchd` command. Only the front door is installed at
-boot; models are started and stopped by the arbiter as requests name them.
+Power users drive `orchd` directly; the front door adds nothing to learn.
 
 ## Specs
 

@@ -1,19 +1,13 @@
 #!/bin/sh
-# Grow the ds4 front door. This is the whole install:
+# Start the ds4 front door. That's the whole story:
 #
-#   ./run            build if needed, then start the front door. That's it.
-#   ./run restart    restart the front door (after changing specs or code)
-#   ./run down       stop the front door
-#   ./run stop       unload every model, freeing the GPU
-#   ./run status     list each model and whether it is running
-#   ./run build      just build the front door
-#   ./run <model> <verb> [...]   poke one model directly, e.g.
-#                                ./run glm53server grow   (start it)
-#                                ./run ds4server fell     (stop it)
+#   ./run            build if needed, then start it
+#   ./run restart    restart it (after changing specs or code)
+#   ./run down       stop everything — every model, then the front door
 #
-# After `./run`, point any OpenAI client at http://127.0.0.1:8899/v1 and ask
-# for a model by name; the front door raises it. No per-model commands needed
-# in normal use.
+# From then on it owns the GPU: a client names a model and the front door
+# swaps the holder under a single lock. There is no per-model command —
+# power users drive `orchd` directly.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -31,25 +25,18 @@ ctl() {
              --orchfile "$ROOT/arbiter.orch" --namespace ctl --user "$@"
 }
 
-mdl() {
-    name=$1; shift
-    "$ORCHD" --project-dir "$ROOT" --state-dir "$state_root/$name" \
-             --orchfile "$ROOT/services/$name.orch" --namespace "$name" --user "$@"
+# Fell every model grove, so nothing is left holding the GPU.
+models_down() {
+    for f in "$ROOT"/services/*.orch; do
+        n=$(basename "$f" .orch)
+        "$ORCHD" --project-dir "$ROOT" --state-dir "$state_root/$n" \
+                 --namespace "$n" --user fell --keep-data >/dev/null 2>&1 || true
+    done
 }
 
 case "${1:-up}" in
     up)      build; ctl grow ;;
-    restart) build; ctl fell --keep-data || true; ctl grow ;;
-    down)    ctl fell --keep-data ;;
-    build)   build ;;
-    stop)    for f in "$ROOT"/services/*.orch; do
-                 mdl "$(basename "$f" .orch)" fell --keep-data || true
-             done ;;
-    status)  for f in "$ROOT"/services/*.orch; do
-                 n=$(basename "$f" .orch)
-                 printf '%-22s ' "$n"
-                 mdl "$n" survey --json 2>/dev/null | tr -d '\n' || true
-                 echo
-             done ;;
-    *)       name=$1; shift; mdl "$name" "$@" ;;
+    restart) build; ctl fell --keep-data >/dev/null 2>&1 || true; ctl grow ;;
+    down)    models_down; ctl fell --keep-data >/dev/null 2>&1 || true ;;
+    *)       echo "usage: $0 [up|restart|down]" >&2; exit 2 ;;
 esac
