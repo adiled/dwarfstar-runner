@@ -8,7 +8,7 @@ ORCHD=${ORCHD:-$HOME/.local/bin/orchd}
 [ -x "$ORCHD" ] || ORCHD=orchd
 state_root=${STATE_ROOT:-$HOME/.orch/g}
 
-for f in "$ROOT"/services/*.orch; do
+for f in "$ROOT"/servers/*.orch; do
     n=$(basename "$f" .orch)
     "$ORCHD" --project-dir "$ROOT" --state-dir "$state_root/$n" \
              --namespace "$n" --user fell --keep-data >/dev/null 2>&1 || true

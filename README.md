@@ -13,9 +13,54 @@ when it is down, and forwards the request. Everything else runs on stock
 ./stop     # stop everything
 ```
 
+The front door reads its roster from `servers/`. The repository ships examples in
+`servers-template/`, and on a fresh clone `servers/` is empty, so `./run` will
+exit with `no specs matched`. Copy what you need, or symlink it in from wherever
+you keep it:
+
+```sh
+cp servers-template/ds4server.orch servers/
+ln -s ~/my-models/llama.orch servers/llama.orch
+```
+
 Start once, then point any OpenAI client at `http://127.0.0.1:8899/v1` and name a
 model. That address is the only one a client needs to know. Models appear and
 disappear as requests arrive, so there are no per-model commands to run.
+
+## Adapting it to your use case
+
+The front door accepts any server that follows the conventions below. The
+directory `servers/` is ignored by git, so the Orchfiles in it are yours to
+arrange however you like.
+
+- The arbiter globs `servers/*.orch`, so the directory and the extension are
+  fixed.
+- It reads the first service in the file, so keep one service per Orchfile. A
+  second service in the file would be grown by orchd and remain invisible to the
+  arbiter.
+- Name the file after its service. The service name becomes the grove's state
+  directory and namespace, and `run` and `stop` derive the same name from the
+  file name. When the two differ, `./stop` will not find the grove the arbiter
+  created.
+- The `RUN` line must contain `--port N`. The arbiter reads the port from that
+  flag and connects to `127.0.0.1:N`.
+- Set `HEALTHCHECK` to a URL that answers 200 once the service is ready. Without
+  it the arbiter falls back to `http://127.0.0.1:N/v1/models`.
+- Set `ENV MODELS` to the names clients will ask for. Without it the arbiter
+  advertises the service name.
+- Give every service that must not run at the same time the same
+  `DS4_LOCK_FILE`.
+
+The services must answer an OpenAI request, because the arbiter relays the body
+unchanged and reads the `model` field from it. Anything that accepts
+`POST /v1/chat/completions` with a `model` key will work.
+
+Two settings of one model become two Orchfiles. The weights stay on disk once,
+and the shared lock keeps the pair from running together.
+
+The front door enforces one holder across the whole roster. Every switch stops
+the other groves, so all models are mutually exclusive by construction. Two
+models that need to be resident at the same time cannot be expressed here.
 
 ## How it works
 
@@ -27,7 +72,7 @@ Orchfile](https://github.com/adiled/orchd#write-an-orchfile), and the model that
 gives it its vocabulary of groves, sow, plant and tend is described in [The
 Orchard Model](https://github.com/adiled/orchd/blob/main/ORCHARD.md).
 
-Each model here has its own Orchfile in `services/`. The arbiter reads that
+Each model here has its own Orchfile in `servers/`. The arbiter reads that
 directory, parses every Orchfile with `orch parse`, and treats the result as the
 roster, so the available models are the files that are present. Each Orchfile is
 planted into its own grove, which is a namespace with its own state directory.

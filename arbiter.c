@@ -5,7 +5,7 @@
  * model is serving without ever killing a process by hand. It is a pure client
  * of the orch toolchain:
  *
- *   roster : `orch parse services/<name>.orch`          (name, port, health)
+ *   roster : `orch parse servers/<name>.orch`          (name, port, health)
  *   start  : `orchd ... --state-dir ~/.orch/g/<name> grow`
  *   stop   : `orchd ... --state-dir ~/.orch/g/<name> fell --keep-data`
  *
@@ -18,7 +18,7 @@
  * same DS4_LOCK_FILE, so at most one model ever runs.
  *
  *   GET  /v1/models       -> every advertised id
- *   POST /v1/*            -> resolve "model" -> raise the grove -> relay
+ *   POST /v1/...          -> resolve "model" -> raise the grove -> relay
  */
 
 #define _DARWIN_C_SOURCE
@@ -137,7 +137,7 @@ static int port_from_cmd(const char *cmd) {
 
 static int discover(char *err, size_t errn) {
     char pattern[PATH_MAX];
-    snprintf(pattern, sizeof pattern, "%s/services/*.orch", g_dir);
+    snprintf(pattern, sizeof pattern, "%s/servers/*.orch", g_dir);
 
     glob_t gl;
     if (glob(pattern, 0, NULL, &gl) != 0) {
@@ -179,7 +179,7 @@ static int discover(char *err, size_t errn) {
     globfree(&gl);
 
     if (nmodels == 0) {
-        snprintf(err, errn, "no services with a port under %s/services", g_dir);
+        snprintf(err, errn, "no services with a port under %s/servers", g_dir);
         return -1;
     }
     return 0;
