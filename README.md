@@ -13,6 +13,13 @@ when it is down, and forwards the request. Everything else runs on stock
 ./stop     # stop everything
 ```
 
+`./run` also starts `watch`, which posts a macOS notification, "Watch out!
+Dwarfstar is cooking …", when a runner model pushes the chip into thermal
+throttling, memory pressure or swap growth, when a server logs a failure such
+as running out of GPU memory, or when the disk holding the models runs low.
+`./watch --test` sends one to check that notifications reach you. Its
+thresholds are the `WATCH_*` ARGs in `arbiter.orch`.
+
 The templates run ds4 from the checkout in `DWARFSTAR_DIR`, which defaults to
 `~/ds4`. If yours is elsewhere, pass it when you start the front door:
 
@@ -27,8 +34,8 @@ once per `./run`. `ORCH_ARG_<name>` is orch's way to override any Orchfile
 The runner keeps its own files under `~/.ds4/dwarfstar-runner`, beside ds4's
 saved sessions in `~/.ds4/kvcache`:
 
-- `logs/<template>.log` and `logs/arbiter.log`: each server's and the
-  arbiter's output.
+- `logs/<template>.log`, `logs/arbiter.log` and `logs/watch.log`: each
+  server's, the arbiter's and the watch's output.
 - `kv/<template>/`: each model's disk KV cache, capped by the template's
   `--kv-disk-space-mb`. A vision template shares its text sibling's cache.
 
@@ -47,8 +54,7 @@ cp servers-template/ds4server.orch servers/
 
 A template is advertised only while every file in its `ENV WEIGHTS` is on disk,
 so models appear as you download them. A request for one whose files are
-missing gets a 404 naming the absent file, instead of waiting on a server that
-cannot start.
+missing gets a 404 naming the absent file.
 
 Or bring in an Orchfile you keep elsewhere:
 
@@ -75,7 +81,7 @@ and Qwen.
 |---|---|---|---|---|
 | `ds4server` | `deepseek-v4-flash` | `ds4f-q2-q4`, `ds4f-dspark` | resident, DSpark | 8888 |
 | `ds4flash-q2` | `deepseek-v4-flash-iq2` | `ds4f-q2`, `ds4f-dspark` | resident, DSpark | 8890 |
-| `ds4flash-q2-legacy` | `deepseek-v4-flash-iq2-legacy` | pre-0731 Q2, no longer offered | resident | 8891 |
+| `ds4flash-q2-legacy` | `deepseek-v4-flash-iq2-legacy` | none (pre-0731 checkpoint) | resident | 8891 |
 | `ds4flash-q4` | `deepseek-v4-flash-q4` | `ds4f-q4` | streaming | 8892 |
 | `ds4flash-mxfp4` | `deepseek-v4-flash-mxfp4` | `ds4f-mxfp4` | streaming | 8893 |
 | `ds4vision-q2` | `deepseek-v4-flash-vision`, `deepseek-v4-flash-vision-q2` | `ds4f-vision-q2`, `ds4f-vision-dspark` | resident, DSpark, vision | 8894 |
@@ -86,7 +92,7 @@ and Qwen.
 | `ds41flash-q4` | `deepseek-v4.1-flash-q4` | `ds41f-q4` | streaming | 8897 |
 | `ds41flash-mxfp4` | `deepseek-v4.1-flash-mxfp4` | `ds41f-mxfp4` | streaming | 8898 |
 | `ds4pro-q2` | `deepseek-v4-pro-q2` | `pro-q2-imatrix` | streaming, slow on 128 GB | 8901 |
-| `glm53server` | `glm-5.2`, `glm-5.2-chat`, `glm-5.2-reasoner` | `glm53-q2` | resident, MTP | 8889 |
+| `glm53server` | `glm-5.3-flash`, `glm-5.3-flash-chat`, `glm-5.3-flash-reasoner` | `glm53-q2` | resident, MTP | 8889 |
 | `glm53flash-vision` | `glm-5.3-flash-vision` | `glm53-q2`, `glm53-vision` | resident, MTP, vision | 8903 |
 | `glm53flash-q4` | `glm-5.3-flash-q4` | `glm53-q4` | streaming | 8902 |
 | `glm53full-q2` | `glm-5.3`, `glm-5.3-q2` | `glm53-full-q2` | streaming | 8904 |
@@ -98,16 +104,19 @@ and Qwen.
 | `qwen38-q2` | `qwen3.8-flash-next-q2` | `qwen38-q2` | resident, MTP | 8909 |
 | `qwen38-q4k-vision` | `qwen3.8-flash-next-vision` | `qwen38-q4k`, `qwen38-vision` | resident, MTP, vision | 8911 |
 
-`glm53server` serves GLM 5.3 Flash under the `glm-5.2` ids, the names its
-clients already ask for. Model ids are unique across templates because the
-arbiter answers with the first file, in name order, that lists the id.
+Model ids are unique across templates because the arbiter answers with the
+first file, in name order, that lists the id.
+
+The `-chat` and `-reasoner` ids pick thinking per request: ds4-server turns
+thinking off for `glm-5.3-flash-chat` and on for `glm-5.3-flash-reasoner`, and
+leaves its default (on) for the plain id. A request's own `thinking`,
+`reasoning_effort` or `think` field takes precedence over the id.
 
 A vision template loads the same weights as its text sibling plus an encoder,
 so the pair cannot run together; the shared lock keeps one at a time.
 
-Server-side session batching (`--batched-session`) is left off: it disables
-DSpark and MTP, and GLM 5.3 and streaming V4.1 gain little from it. Add it to a
-template when several clients share one model at once.
+Templates run without `--batched-session`, which turns DSpark and MTP off. Add
+it to a template when several clients share one model at once.
 
 ### GPU memory for resident models
 
@@ -178,7 +187,8 @@ planted into its own grove, which is a namespace with its own state directory.
 Separate groves are what allow the arbiter to stop one model while the rest stay
 untouched.
 
-The arbiter runs in its own grove. For each request it resolves the model name,
+The arbiter runs in its own grove, beside the watch and apart from the models.
+For each request it resolves the model name,
 asks `orchd survey` which grove holds the GPU, stops the other groves with
 `orchd fell`, starts the target with `orchd grow`, waits for the target's
 `HEALTHCHECK` to answer, and relays the request to that model's port. Response
@@ -197,7 +207,8 @@ lock free during normal use.
 
 ## Roadmap
 
-This repository runs one grove per model plus a controller grove for the arbiter.
+This repository runs one grove per model plus a controller grove for the arbiter
+and the watch.
 The arbiter exists because orchd does not yet cover the work directly, so the
 shape of this repository tracks the state of that project.
 

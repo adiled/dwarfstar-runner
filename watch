@@ -1,0 +1,208 @@
+#!/bin/sh
+# Watch for trouble the runner's models cause and raise a macOS notification
+# when it starts: thermal throttling, memory pressure or swap growth while a
+# runner model is loaded, engine failures in the server logs, and low disk
+# where the models live. It notifies when a condition begins or escalates,
+# quietly when it clears, and repeats a log alert at most every ten minutes.
+#
+# Runs as the `watch` service of arbiter.orch and logs to
+# ~/.ds4/dwarfstar-runner/logs/watch.log. Needs no sudo; adds GPU temperature
+# and power to alerts when macmon is installed.
+#
+#   ./watch           watch until stopped
+#   ./watch --test    send one notification and exit (check permissions)
+set -u
+
+INTERVAL=${WATCH_INTERVAL:-15}
+SWAP_GROWTH_MB=$(( ${WATCH_SWAP_GROWTH_GB:-2} * 1024 ))
+DISK_MIN_GB=${WATCH_DISK_MIN_GB:-25}
+RUNNER=${WATCH_HOME:-$HOME/.ds4/dwarfstar-runner}
+MODELS_DIR=${DWARFSTAR_DIR:-$HOME/ds4}
+case "$MODELS_DIR" in "~"*) MODELS_DIR=$HOME${MODELS_DIR#\~} ;; esac
+[ -d "$MODELS_DIR" ] || MODELS_DIR=$HOME
+STATE=$RUNNER/watch
+mkdir -p "$STATE"
+
+ERROR_RE='Metal command batch failed|Insufficient Memory|[Oo]ut of memory|finish=error|could not|[Ff]ailed to|refus'
+IGNORE_RE='client disconnected|metadata_errors|kv cache discarded'
+
+log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+
+notify() { # thing who body [quiet]
+    clean() { printf '%s' "$1" | tr '"\\' "' "; }
+    if [ "${4:-}" = quiet ]; then
+        title="Dwarfstar is done cooking $1"
+        sound=''
+    else
+        title="Watch out! Dwarfstar is cooking $1"
+        sound='sound name "Basso"'
+    fi
+    osascript -e "display notification \"$(clean "$3")\" with title \"$(clean "$title")\" subtitle \"$(clean "$2")\" $sound" \
+        >/dev/null 2>&1
+    log "$title [$2] $3"
+}
+
+# pid, kv label and model file of the runner's ds4-server; the runner's
+# servers are the ones whose disk KV cache lives under $RUNNER/kv.
+runner_model() {
+    ps -axo pid=,command= | awk -v k="$RUNNER/kv/" '
+        $2 ~ /ds4-server$/ && index($0, k) {
+            label = "?"; model = "?"
+            for (i = 3; i < NF; i++) {
+                if ($i == "--model") { model = $(i + 1); sub(/.*\//, "", model) }
+                if ($i == "--kv-disk-dir") { label = $(i + 1); sub(/.*\//, "", label) }
+            }
+            print $1, label, model
+            exit
+        }'
+}
+
+thermal_level() {
+    notifyutil -g com.apple.system.thermalpressurelevel 2>/dev/null | awk '{ print $NF + 0 }'
+}
+thermal_name() {
+    case "$1" in
+        0) echo nominal ;; 1) echo moderate ;; 2) echo heavy ;;
+        3) echo trapping ;; 4) echo sleeping ;; *) echo "level $1" ;;
+    esac
+}
+mem_level() { sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo 1; }
+mem_name() {
+    case "$1" in 1) echo normal ;; 2) echo warning ;; 4) echo critical ;; *) echo "level $1" ;; esac
+}
+swap_mb() { sysctl -n vm.swapusage | awk '{ v = $6; sub(/M$/, "", v); printf "%d", v }'; }
+wired_gb() {
+    vm_stat | awk '/page size of/ { ps = $8 } /wired down/ { w = $4 }
+                   END { printf "%.0f", w * ps / 1073741824 }'
+}
+disk_free_gb() { df -k "$MODELS_DIR" | awk 'NR == 2 { printf "%d", $4 / 1048576 }'; }
+
+# What the chip is doing right now, when macmon is installed.
+chip() {
+    command -v macmon >/dev/null 2>&1 || return 0
+    macmon pipe -s 1 -i 500 2>/dev/null | awk '{
+        t = "?"; p = "?"
+        if (match($0, /"gpu_temp_avg":[0-9.]+/)) t = sprintf("%.0f", substr($0, RSTART + 15, RLENGTH - 15))
+        if (match($0, /"gpu_power":[0-9.]+/)) p = sprintf("%.0f", substr($0, RSTART + 12, RLENGTH - 12))
+        printf " GPU %s C, %s W.", t, p
+    }'
+}
+
+hint() {
+    case "$1" in
+        *"Insufficient Memory"*)
+            limit=$(sysctl -n iogpu.wired_limit_mb 2>/dev/null || echo 0)
+            if [ "${limit:-0}" -eq 0 ]; then
+                printf ' The GPU wired limit is at its default (it resets at reboot): sudo sysctl iogpu.wired_limit_mb=110000.'
+            else
+                printf ' The model and its context do not fit under the %s MB GPU wired limit.' "$limit"
+            fi
+            ;;
+    esac
+}
+
+alert_once() { # label message
+    now=$(date +%s)
+    key=$(printf '%s %s' "$1" "$2" | cksum | awk '{ print $1 }')
+    last=$(awk -v k="$key" '$1 == k { t = $2 } END { print t }' "$STATE/seen" 2>/dev/null)
+    if [ -n "$last" ] && [ $((now - last)) -lt 600 ]; then return 0; fi
+    echo "$key $now" >> "$STATE/seen"
+    tail -n 200 "$STATE/seen" > "$STATE/seen.tmp" && mv "$STATE/seen.tmp" "$STATE/seen"
+    case "$2" in
+        *"Insufficient Memory"* | *"ut of memory"*) thing="your GPU memory" ;;
+        *) thing="errors" ;;
+    esac
+    notify "$thing" "$1" "$2$(hint "$2")"
+}
+
+# New error lines in the servers' logs since the last scan. A log seen for the
+# first time starts at its end, so history does not alert.
+scan_logs() {
+    for f in "$RUNNER"/logs/*.log; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f" .log)
+        case "$name" in watch | arbiter) continue ;; esac
+        size=$(stat -f %z "$f")
+        if [ ! -f "$STATE/off.$name" ]; then
+            echo "$size" > "$STATE/off.$name"
+            continue
+        fi
+        off=$(cat "$STATE/off.$name")
+        [ "$size" -lt "$off" ] && off=0
+        if [ "$size" -gt "$off" ]; then
+            tail -c +"$((off + 1))" "$f" | grep -E "$ERROR_RE" | grep -v -E "$IGNORE_RE" |
+                while IFS= read -r line; do
+                    alert_once "$name" "$(printf '%s' "$line" | sed -E 's/^[0-9]{4} [0-9:]{8} //' | cut -c1-160)"
+                done
+            echo "$size" > "$STATE/off.$name"
+        fi
+    done
+}
+
+if [ "${1:-}" = --test ]; then
+    notify "nothing" "test" "Just checking that notifications reach you.$(chip)"
+    exit 0
+fi
+
+log "watching every ${INTERVAL}s: thermal, memory, swap +$((SWAP_GROWTH_MB / 1024)) GB, disk < ${DISK_MIN_GB} GB in $MODELS_DIR"
+scan_logs
+model_pid=""
+last_thermal=0
+last_mem=1
+swap_base=0
+swap_alerted=0
+disk_low=0
+
+while :; do
+    set -- $(runner_model)
+    pid=${1:-}
+    if [ -n "$pid" ]; then
+        who="${2:-?} (${3:-?})"
+        if [ "$pid" != "$model_pid" ]; then
+            model_pid=$pid
+            swap_base=$(swap_mb)
+            swap_alerted=0
+            log "model loaded: $who, pid $pid, swap ${swap_base} MB"
+        fi
+
+        th=$(thermal_level)
+        th=${th:-0}
+        if [ "$th" -ge 2 ] && [ "$th" -gt "$last_thermal" ]; then
+            notify "your chip" "$who" "Thermal pressure is $(thermal_name "$th"): macOS is throttling.$(chip)"
+        elif [ "$th" -lt 2 ] && [ "$last_thermal" -ge 2 ]; then
+            notify "your chip" "$who" "Thermal pressure back to $(thermal_name "$th")." quiet
+        fi
+        last_thermal=$th
+
+        mem=$(mem_level)
+        if [ "$mem" -ge 2 ] && [ "$mem" -gt "$last_mem" ]; then
+            notify "your memory" "$who" "Memory pressure is $(mem_name "$mem") with $(wired_gb) GB wired. Stop or switch the model to free it."
+        elif [ "$mem" -lt 2 ] && [ "$last_mem" -ge 2 ]; then
+            notify "your memory" "$who" "Memory pressure back to normal." quiet
+        fi
+        last_mem=$mem
+
+        sw=$(swap_mb)
+        if [ "$swap_alerted" -eq 0 ] && [ $((sw - swap_base)) -ge "$SWAP_GROWTH_MB" ]; then
+            notify "your swap" "$who" "Swap grew $(((sw - swap_base) / 1024)) GB since the model loaded: the system is paging around it."
+            swap_alerted=1
+        fi
+    elif [ -n "$model_pid" ]; then
+        log "model unloaded"
+        model_pid=""
+        last_thermal=0
+        last_mem=1
+    fi
+
+    free=$(disk_free_gb)
+    if [ "$disk_low" -eq 0 ] && [ "$free" -lt "$DISK_MIN_GB" ]; then
+        notify "your disk" "$MODELS_DIR" "Only $free GB free. Models, downloads and KV caches need room."
+        disk_low=1
+    elif [ "$disk_low" -eq 1 ] && [ "$free" -ge $((DISK_MIN_GB + 5)) ]; then
+        notify "your disk" "$MODELS_DIR" "$free GB free again." quiet
+        disk_low=0
+    fi
+
+    scan_logs
+    sleep "$INTERVAL"
+done

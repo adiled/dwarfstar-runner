@@ -6,8 +6,22 @@ ORCH_VERSION 1.0.0-rc
 # `ORCH_ARG_DWARFSTAR_DIR=/path ./run`.
 ARG DWARFSTAR_DIR=~/ds4
 
+# When the watch raises "Watch out! Dwarfstar is cooking ...": seconds between
+# checks, swap growth since a model loaded, and free disk where models live.
+ARG WATCH_INTERVAL=15
+ARG WATCH_SWAP_GROWTH_GB=2
+ARG WATCH_DISK_MIN_GB=25
+
 SERVICE arbiter
 RUN bash -c 'mkdir -p ~/.ds4/dwarfstar-runner/logs && exec "${ORCH_PROJECT}/arbiter" --dir "${ORCH_PROJECT}" --orch ~/.local/bin/orch --orchd ~/.local/bin/orchd --listen 127.0.0.1:8899 >> ~/.ds4/dwarfstar-runner/logs/arbiter.log 2>&1'
 ENV ORCH_ARG_DWARFSTAR_DIR=${DWARFSTAR_DIR}
 HEALTHCHECK http://127.0.0.1:8899/v1/models
+RESTART always
+
+SERVICE watch
+RUN bash -c 'mkdir -p ~/.ds4/dwarfstar-runner/logs && exec "${ORCH_PROJECT}/watch" >> ~/.ds4/dwarfstar-runner/logs/watch.log 2>&1'
+ENV DWARFSTAR_DIR=${DWARFSTAR_DIR}
+ENV WATCH_INTERVAL=${WATCH_INTERVAL}
+ENV WATCH_SWAP_GROWTH_GB=${WATCH_SWAP_GROWTH_GB}
+ENV WATCH_DISK_MIN_GB=${WATCH_DISK_MIN_GB}
 RESTART always
