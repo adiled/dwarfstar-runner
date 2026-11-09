@@ -1,6 +1,6 @@
 # DwarfStar (ds4) model servers via `orchd`
 
-Five model checkpoints share one GPU behind a single HTTP address. A client sends
+DwarfStar model checkpoints share one GPU behind a single HTTP address. A client sends
 an OpenAI request to `http://127.0.0.1:8899/v1` and names the model it wants. A
 small C program called the arbiter decides which model holds the GPU, starts it
 when it is down, and forwards the request. Everything else runs on stock
@@ -13,14 +13,29 @@ when it is down, and forwards the request. Everything else runs on stock
 ./stop     # stop everything
 ```
 
-The front door reads its roster from `servers/`. The repository ships examples in
-`servers-template/`, and on a fresh clone `servers/` is empty, so `./run` will
-exit with `no specs matched`. Link every template in, or copy the ones you want:
+The templates run ds4 from the checkout in `DWARFSTAR_DIR`, which defaults to
+`~/ds4`. If yours is elsewhere, pass it when you start the front door:
 
 ```sh
-for f in servers-template/*.orch; do ln -s "../$f" servers/; done
-cp servers-template/ds4server.orch servers/
+ORCH_ARG_DWARFSTAR_DIR=~/src/ds4 ./run
 ```
+
+The arbiter keeps that value and hands it to every model it starts, so set it
+once per `./run`. `ORCH_ARG_<name>` is orch's way to override any Orchfile
+`ARG`.
+
+The front door reads its roster from `servers/`. The repository ships examples in
+`servers-template/`, and on a fresh clone `servers/` is empty, so `./run` will
+exit with `no specs matched`. Link in the templates whose model files you have,
+or copy them:
+
+```sh
+ln -s ../servers-template/ds4server.orch servers/
+cp servers-template/glm53server.orch servers/
+```
+
+Leave out templates whose GGUF is not on disk: the server would exit at once
+and a request for it would wait out the arbiter's timeout.
 
 Or bring in an Orchfile you keep elsewhere:
 
@@ -31,6 +46,68 @@ ln -s ~/my-models/llama.orch servers/llama.orch
 Start once, then point any OpenAI client at `http://127.0.0.1:8899/v1` and name a
 model. That address is the only one a client needs to know. Models appear and
 disappear as requests arrive, so there are no per-model commands to run.
+
+## Templates
+
+One template per DwarfStar download, set up for a 128 GB Apple Silicon Mac.
+Each runs `${DWARFSTAR_DIR}/ds4-server` with its GGUFs under
+`${DWARFSTAR_DIR}/gguf/`; fetch a model with `./download_model.sh <target>` in
+the ds4 checkout. *Resident* models are held
+in memory; *streaming* models are larger than RAM and read routed experts from
+SSD (`--ssd-streaming`). Speculative decoding is on wherever the model supports
+it with a resident target: DSpark for V4 Flash, the built-in MTP block for GLM
+and Qwen.
+
+| Template | Model ids | ds4 download target | Mode | Port |
+|---|---|---|---|---|
+| `ds4server` | `deepseek-v4-flash`, `deepseek-v4-pro` | `ds4f-q2-q4`, `ds4f-dspark` | resident, DSpark | 8888 |
+| `ds4flash-q2` | `deepseek-v4-flash-iq2` | `ds4f-q2`, `ds4f-dspark` | resident, DSpark | 8890 |
+| `ds4flash-q2-legacy` | `deepseek-v4-flash-iq2-legacy` | pre-0731 Q2, no longer offered | resident | 8891 |
+| `ds4flash-q4` | `deepseek-v4-flash-q4` | `ds4f-q4` | streaming | 8892 |
+| `ds4flash-mxfp4` | `deepseek-v4-flash-mxfp4` | `ds4f-mxfp4` | streaming | 8893 |
+| `ds4vision-q2` | `deepseek-v4-flash-vision`, `deepseek-v4-flash-vision-q2` | `ds4f-vision-q2`, `ds4f-vision-dspark` | resident, DSpark, vision | 8894 |
+| `ds4vision-q2-q4` | `deepseek-v4-flash-vision-q2-q4` | `ds4f-vision-q2-q4`, `ds4f-vision-dspark` | resident, DSpark, vision | 8895 |
+| `ds4vision-mxfp4` | `deepseek-v4-flash-vision-mxfp4` | `ds4f-vision-mxfp4` | streaming, vision | 8896 |
+| `ds41server` | `deepseek-v4.1-flash` | `ds41f-q2` | streaming | 8887 |
+| `ds41flash-vision` | `deepseek-v4.1-flash-vision` | `ds41f-q2`, `ds41f-vision` | streaming, vision | 8900 |
+| `ds41flash-q4` | `deepseek-v4.1-flash-q4` | `ds41f-q4` | streaming | 8897 |
+| `ds41flash-mxfp4` | `deepseek-v4.1-flash-mxfp4` | `ds41f-mxfp4` | streaming | 8898 |
+| `ds4pro-q2` | `deepseek-v4-pro-q2` | `pro-q2-imatrix` | streaming, slow on 128 GB | 8901 |
+| `glm53server` | `glm-5.2`, `glm-5.2-chat`, `glm-5.2-reasoner` | `glm53-q2` | resident, MTP | 8889 |
+| `glm53flash-vision` | `glm-5.3-flash-vision` | `glm53-q2`, `glm53-vision` | resident, MTP, vision | 8903 |
+| `glm53flash-q4` | `glm-5.3-flash-q4` | `glm53-q4` | streaming | 8902 |
+| `glm53full-q2` | `glm-5.3`, `glm-5.3-q2` | `glm53-full-q2` | streaming | 8904 |
+| `glm52-iq2xxs` | `glm-5.2-iq2xxs` | `glm-antirez-iq2xxs` | streaming | 8905 |
+| `glm52-q2` | `glm-5.2-q2` | `glm-antirez-q2` | streaming | 8906 |
+| `glm52-q4` | `glm-5.2-q4` | `glm-antirez-q4` | streaming | 8907 |
+| `glm52-unsloth-q4` | `glm-5.2-unsloth-q4` | `glm-unsloth-q4` | streaming | 8908 |
+| `qwen38-q4k` | `qwen3.8-flash-next`, `qwen3.8-flash-next-q4` | `qwen38-q4k` | resident, MTP | 8910 |
+| `qwen38-q2` | `qwen3.8-flash-next-q2` | `qwen38-q2` | resident, MTP | 8909 |
+| `qwen38-q4k-vision` | `qwen3.8-flash-next-vision` | `qwen38-q4k`, `qwen38-vision` | resident, MTP, vision | 8911 |
+
+`glm53server` serves GLM 5.3 Flash under the `glm-5.2` ids, the names its
+clients already ask for. Model ids are unique across templates because the
+arbiter answers with the first file, in name order, that lists the id.
+
+A vision template loads the same weights as its text sibling plus an encoder,
+so the pair cannot run together; the shared lock keeps one at a time.
+
+Server-side session batching (`--batched-session`) is left off: it disables
+DSpark and MTP, and GLM 5.3 and streaming V4.1 gain little from it. Add it to a
+template when several clients share one model at once.
+
+### GPU memory for resident models
+
+A resident model of about 90 GiB needs more GPU wired memory than macOS grants
+by default on a 128 GB Mac. Without it the first prefill fails with
+`kIOGPUCommandBufferCallbackErrorOutOfMemory`. Raise the limit once per boot:
+
+```sh
+sudo sysctl iogpu.wired_limit_mb=110000
+```
+
+That matches Metal's recommended working set on a 128 GB M5 Max and leaves
+room for the system. It is a ceiling, not a reservation.
 
 ## Adapting it to your use case
 
@@ -118,6 +195,6 @@ What orchd does not do yet:
   the only reliable field. Tracked as
   [orchd#56](https://github.com/adiled/orchd/issues/56).
 
-With a per-service stop and an in-place reload, the five models could share a
+With a per-service stop and an in-place reload, the models could share a
 single grove. The arbiter would still choose which model runs, and the
 grove-per-model split would disappear.

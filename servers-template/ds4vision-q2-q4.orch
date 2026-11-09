@@ -1,0 +1,14 @@
+ORCH_VERSION 1.0.0-rc
+
+# The ds4 checkout: ds4-server, and its GGUFs under gguf/. Override per machine
+# with ORCH_ARG_DWARFSTAR_DIR (see README).
+ARG DWARFSTAR_DIR=~/ds4
+
+SERVICE ds4vision-q2-q4
+RUN bash -c 'cd ${DWARFSTAR_DIR} && exec nice -n 10 ${DWARFSTAR_DIR}/ds4-server --model ${DWARFSTAR_DIR}/gguf/DeepSeek-V4-Flash-Vision-Exp-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8.gguf --host 0.0.0.0 --port 8895 --cors --ctx 32768 --vision ${DWARFSTAR_DIR}/gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf --dspark --mtp-model ${DWARFSTAR_DIR}/gguf/DeepSeek-V4-Flash-Vision-Exp-DSpark-support.gguf --kv-disk-dir ~/.ds4/server-kv-ds4vision-q2-q4 --kv-disk-space-mb 8192 --threads 8'
+ENV DS4_LOCK_FILE=/tmp/ds4-gpu.lock
+ENV MODELS=deepseek-v4-flash-vision-q2-q4
+STDOUT /tmp/ds4-ds4vision-q2-q4.log
+STDERR /tmp/ds4-ds4vision-q2-q4.log
+HEALTHCHECK http://127.0.0.1:8895/v1/models
+RESTART no
