@@ -24,6 +24,18 @@ The arbiter keeps that value and hands it to every model it starts, so set it
 once per `./run`. `ORCH_ARG_<name>` is orch's way to override any Orchfile
 `ARG`.
 
+The runner keeps its own files under `~/.ds4/dwarfstar-runner`, beside ds4's
+saved sessions in `~/.ds4/kvcache`:
+
+- `logs/<template>.log` and `logs/arbiter.log`: each server's and the
+  arbiter's output.
+- `kv/<template>/`: each model's disk KV cache, capped by the template's
+  `--kv-disk-space-mb`. A vision template shares its text sibling's cache.
+
+A server that fails before ds4 starts, for instance on a wrong
+`DWARFSTAR_DIR`, reports it in orchd's launchd log instead:
+`~/Library/Logs/<template>.<template>.err.log`.
+
 The front door reads its roster from `servers/`. The repository ships examples in
 `servers-template/`, and on a fresh clone `servers/` is empty, so `./run` will
 exit with `no specs matched`. Link in the templates whose model files you have,
