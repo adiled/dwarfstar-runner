@@ -8,5 +8,6 @@ SERVICE glm52-iq2xxs
 RUN bash -c 'mkdir -p ~/.ds4/dwarfstar-runner/logs && cd ${DWARFSTAR_DIR} && exec nice -n 10 ${DWARFSTAR_DIR}/ds4-server --model ${DWARFSTAR_DIR}/gguf/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf --host 0.0.0.0 --port 8905 --cors --backend metal --ctx 32768 --ssd-streaming --kv-disk-dir ~/.ds4/dwarfstar-runner/kv/glm52-iq2xxs --kv-disk-space-mb 8192 --threads 8 >> ~/.ds4/dwarfstar-runner/logs/glm52-iq2xxs.log 2>&1'
 ENV DS4_LOCK_FILE=/tmp/ds4-gpu.lock
 ENV MODELS=glm-5.2-iq2xxs
+ENV WEIGHTS=${DWARFSTAR_DIR}/gguf/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf
 HEALTHCHECK http://127.0.0.1:8905/v1/models
 RESTART no

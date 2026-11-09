@@ -8,5 +8,6 @@ SERVICE ds41flash-q4
 RUN bash -c 'mkdir -p ~/.ds4/dwarfstar-runner/logs && cd ${DWARFSTAR_DIR} && exec nice -n 10 ${DWARFSTAR_DIR}/ds4-server --model ${DWARFSTAR_DIR}/gguf/DeepSeek-V4.1-Flash-Q4.gguf --host 0.0.0.0 --port 8897 --cors --ctx 32768 --ssd-streaming --kv-disk-dir ~/.ds4/dwarfstar-runner/kv/ds41flash-q4 --kv-disk-space-mb 8192 --threads 8 >> ~/.ds4/dwarfstar-runner/logs/ds41flash-q4.log 2>&1'
 ENV DS4_LOCK_FILE=/tmp/ds4-gpu.lock
 ENV MODELS=deepseek-v4.1-flash-q4
+ENV WEIGHTS=${DWARFSTAR_DIR}/gguf/DeepSeek-V4.1-Flash-Q4.gguf
 HEALTHCHECK http://127.0.0.1:8897/v1/models
 RESTART no

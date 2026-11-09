@@ -9,6 +9,11 @@
  *   start  : `orchd ... --state-dir ~/.orch/g/<name> grow`
  *   stop   : `orchd ... --state-dir ~/.orch/g/<name> fell --keep-data`
  *
+ * A spec's ENV MODELS lists the ids its grove answers to, and ENV WEIGHTS the
+ * files its server cannot start without. Both are plain ENV directives that
+ * the arbiter reads from `orch parse`. A grove whose weights are not all on
+ * disk is neither advertised nor raised.
+ *
  * Each model is its own grove: one spec file, one namespace, one state dir.
  * Because orchd's `fell` tears down whatever is in its state dir, giving each
  * model its own state dir is what makes `fell` stop exactly one model. The
@@ -58,6 +63,7 @@ typedef struct {
     int  port;
     char health[512];
     char ids[1024];   /* comma-separated model ids this grove answers to */
+    char weights[4096]; /* comma-separated files the server needs, or empty */
 } model_t;
 
 static model_t models[MAX_MODELS];
@@ -128,6 +134,33 @@ static int run_status(const char *cmd) {
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
+/* Whether every file in a grove's ENV WEIGHTS is on disk. A grove that names
+ * a missing file cannot start, so the front door neither advertises nor
+ * raises it; a grove without WEIGHTS is always available. Checked on every
+ * call, so a model appears once its files do. On a miss, the first absent
+ * path goes to missing. */
+static int weights_present(const char *weights, char *missing, size_t missingn) {
+    char tmp[4096];
+    snprintf(tmp, sizeof tmp, "%s", weights);
+    char *save = NULL;
+    for (char *tok = strtok_r(tmp, ",", &save); tok;
+         tok = strtok_r(NULL, ",", &save)) {
+        while (*tok == ' ') tok++;
+        size_t len = strlen(tok);
+        while (len > 0 && tok[len - 1] == ' ') tok[--len] = '\0';
+        if (!tok[0]) continue;
+
+        char path[PATH_MAX];
+        expand_tilde(tok, path, sizeof path);
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+            if (missing) snprintf(missing, missingn, "%s", path);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* Extract the first "--port N" from a run command. */
 static int port_from_cmd(const char *cmd) {
     const char *p = cmd;
@@ -162,9 +195,13 @@ static int discover(char *err, size_t errn) {
         char *run  = json_get_string(json, "services[0].run_command");
         char *hc   = json_get_string(json, "services[0].healthcheck");
         char *ids  = json_get_string(json, "services[0].env.MODELS");
+        char *wts  = json_get_string(json, "services[0].env.WEIGHTS");
         free(json);
 
-        if (!name || !run) { free(name); free(run); free(hc); free(ids); continue; }
+        if (!name || !run) {
+            free(name); free(run); free(hc); free(ids); free(wts);
+            continue;
+        }
 
         model_t *m = &models[nmodels++];
         snprintf(m->name, sizeof m->name, "%s", name);
@@ -191,8 +228,10 @@ static int discover(char *err, size_t errn) {
         /* Model ids the front door advertises for this grove: ENV MODELS if
          * set, else the service name. */
         snprintf(m->ids, sizeof m->ids, "%s", (ids && ids[0]) ? ids : name);
+        /* Files the server cannot start without: ENV WEIGHTS, if set. */
+        snprintf(m->weights, sizeof m->weights, "%s", wts ? wts : "");
 
-        free(name); free(run); free(hc); free(ids);
+        free(name); free(run); free(hc); free(ids); free(wts);
     }
     globfree(&gl);
 
@@ -549,12 +588,13 @@ static void dispatch(int fd, const char *method, const char *path,
      * nothing else; model lifecycle is not its concern. */
 
     if (strcmp(method, "GET") == 0 && strcmp(q, "/v1/models") == 0) {
-        /* Every name any grove answers to, so a client can ask for one and
-         * let the front door raise it. */
+        /* Every name a grove with its weights on disk answers to, so a
+         * client can ask for one and let the front door raise it. */
         sbuf_t s = {0};
         sb_add(&s, "{\"object\":\"list\",\"data\":[");
         int first = 1;
         for (int i = 0; i < nmodels; i++) {
+            if (!weights_present(models[i].weights, NULL, 0)) continue;
             char tmp[1024];
             snprintf(tmp, sizeof tmp, "%s", models[i].ids);
             for (char *tok = strtok(tmp, ","); tok; tok = strtok(NULL, ","))
@@ -585,6 +625,18 @@ static void dispatch(int fd, const char *method, const char *path,
             char out[320];
             snprintf(out, sizeof out,
                      "{\"error\":\"unknown model\",\"model\":\"%s\"}", mid);
+            send_all(fd, 404, "Not Found", out);
+            free(mid);
+            return;
+        }
+        char missing[PATH_MAX];
+        if (!weights_present(models[ti].weights, missing, sizeof missing)) {
+            /* Answer now rather than raise a server that exits at once and
+             * leave the client waiting out the health timeout. */
+            char out[PATH_MAX + 320];
+            snprintf(out, sizeof out,
+                     "{\"error\":\"model weights are not on disk\","
+                     "\"model\":\"%s\",\"missing\":\"%s\"}", mid, missing);
             send_all(fd, 404, "Not Found", out);
             free(mid);
             return;
@@ -715,9 +767,19 @@ int main(int argc, char **argv) {
 
     if (dump) {
         printf("dir: %s\ndiscovered %d models:\n", g_dir, nmodels);
-        for (int i = 0; i < nmodels; i++)
-            printf("  %-22s :%-6d %s\n", models[i].name, models[i].port, models[i].health);
+        for (int i = 0; i < nmodels; i++) {
+            char missing[PATH_MAX];
+            int ok = weights_present(models[i].weights, missing, sizeof missing);
+            printf("  %-22s :%-6d %s%s%s\n", models[i].name, models[i].port,
+                   models[i].health, ok ? "" : "  (missing ", ok ? "" : missing);
+        }
         return 0;
+    }
+
+    for (int i = 0; i < nmodels; i++) {
+        char missing[PATH_MAX];
+        if (!weights_present(models[i].weights, missing, sizeof missing))
+            logf_("%s: not advertised until %s is on disk", models[i].name, missing);
     }
 
     return serve();

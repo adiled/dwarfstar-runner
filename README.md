@@ -4,7 +4,7 @@ DwarfStar model checkpoints share one GPU behind a single HTTP address. A client
 an OpenAI request to `http://127.0.0.1:8899/v1` and names the model it wants. A
 small C program called the arbiter decides which model holds the GPU, starts it
 when it is down, and forwards the request. Everything else runs on stock
-`orchd` 0.3.4.
+`orchd` 0.4.0.
 
 ## How to use
 
@@ -38,16 +38,17 @@ A server that fails before ds4 starts, for instance on a wrong
 
 The front door reads its roster from `servers/`. The repository ships examples in
 `servers-template/`, and on a fresh clone `servers/` is empty, so `./run` will
-exit with `no specs matched`. Link in the templates whose model files you have,
-or copy them:
+exit with `no specs matched`. Link every template in, or copy the ones you want:
 
 ```sh
-ln -s ../servers-template/ds4server.orch servers/
-cp servers-template/glm53server.orch servers/
+for f in servers-template/*.orch; do ln -s "../$f" servers/; done
+cp servers-template/ds4server.orch servers/
 ```
 
-Leave out templates whose GGUF is not on disk: the server would exit at once
-and a request for it would wait out the arbiter's timeout.
+A template is advertised only while every file in its `ENV WEIGHTS` is on disk,
+so models appear as you download them. A request for one whose files are
+missing gets a 404 naming the absent file, instead of waiting on a server that
+cannot start.
 
 Or bring in an Orchfile you keep elsewhere:
 
@@ -72,7 +73,7 @@ and Qwen.
 
 | Template | Model ids | ds4 download target | Mode | Port |
 |---|---|---|---|---|
-| `ds4server` | `deepseek-v4-flash`, `deepseek-v4-pro` | `ds4f-q2-q4`, `ds4f-dspark` | resident, DSpark | 8888 |
+| `ds4server` | `deepseek-v4-flash` | `ds4f-q2-q4`, `ds4f-dspark` | resident, DSpark | 8888 |
 | `ds4flash-q2` | `deepseek-v4-flash-iq2` | `ds4f-q2`, `ds4f-dspark` | resident, DSpark | 8890 |
 | `ds4flash-q2-legacy` | `deepseek-v4-flash-iq2-legacy` | pre-0731 Q2, no longer offered | resident | 8891 |
 | `ds4flash-q4` | `deepseek-v4-flash-q4` | `ds4f-q4` | streaming | 8892 |
@@ -142,6 +143,10 @@ arrange however you like.
   it the arbiter falls back to `http://127.0.0.1:N/v1/models`.
 - Set `ENV MODELS` to the names clients will ask for. Without it the arbiter
   advertises the service name.
+- Set `ENV WEIGHTS` to the files the server cannot start without, separated by
+  commas; `~` and `${ARG}` references work. The arbiter checks them on every
+  request and advertises or raises the grove only while all are on disk.
+  Without it the grove is always advertised.
 - Give every service that must not run at the same time the same
   `DS4_LOCK_FILE`.
 
@@ -181,7 +186,9 @@ streams pass through unchanged, and every connection forks its own process so a
 long switch cannot hold up other clients.
 
 The public interface is OpenAI's `/v1`. The `ENV MODELS` line in each Orchfile
-lists the names its grove answers to.
+lists the names its grove answers to, and `ENV WEIGHTS` the files it needs. Both
+are ordinary `ENV` directives, set in the server's environment like any other,
+that the arbiter also reads from `orch parse`.
 
 ds4 holds an exclusive lock on `DS4_LOCK_FILE`, and every Orchfile points at the
 same file. One model can hold the GPU at a time, whichever way it was started.
@@ -194,7 +201,7 @@ This repository runs one grove per model plus a controller grove for the arbiter
 The arbiter exists because orchd does not yet cover the work directly, so the
 shape of this repository tracks the state of that project.
 
-What orchd does not do yet:
+What orchd 0.4.0 does not do yet:
 
 - `fell` removes the whole state directory of a grove, and no verb stops one
   service on its own. The `orchdi` platform contains `stop(services)`, and the
@@ -203,9 +210,6 @@ What orchd does not do yet:
   and `grow`. Tracked as [orchd#54](https://github.com/adiled/orchd/issues/54).
 - `RECREATE` is unimplemented. Tracked as
   [orchd#59](https://github.com/adiled/orchd/issues/59).
-- `survey` reports a running service as inactive, which leaves the process id as
-  the only reliable field. Tracked as
-  [orchd#56](https://github.com/adiled/orchd/issues/56).
 
 With a per-service stop and an in-place reload, the models could share a
 single grove. The arbiter would still choose which model runs, and the

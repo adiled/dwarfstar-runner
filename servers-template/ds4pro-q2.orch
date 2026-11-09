@@ -8,5 +8,6 @@ SERVICE ds4pro-q2
 RUN bash -c 'mkdir -p ~/.ds4/dwarfstar-runner/logs && cd ${DWARFSTAR_DIR} && exec nice -n 10 ${DWARFSTAR_DIR}/ds4-server --model ${DWARFSTAR_DIR}/gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix-0813.gguf --host 0.0.0.0 --port 8901 --cors --ctx 32768 --ssd-streaming --kv-disk-dir ~/.ds4/dwarfstar-runner/kv/ds4pro-q2 --kv-disk-space-mb 8192 --threads 8 >> ~/.ds4/dwarfstar-runner/logs/ds4pro-q2.log 2>&1'
 ENV DS4_LOCK_FILE=/tmp/ds4-gpu.lock
 ENV MODELS=deepseek-v4-pro-q2
+ENV WEIGHTS=${DWARFSTAR_DIR}/gguf/DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix-0813.gguf
 HEALTHCHECK http://127.0.0.1:8901/v1/models
 RESTART no

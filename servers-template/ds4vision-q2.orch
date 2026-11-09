@@ -8,5 +8,6 @@ SERVICE ds4vision-q2
 RUN bash -c 'mkdir -p ~/.ds4/dwarfstar-runner/logs && cd ${DWARFSTAR_DIR} && exec nice -n 10 ${DWARFSTAR_DIR}/ds4-server --model ${DWARFSTAR_DIR}/gguf/DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf --host 0.0.0.0 --port 8894 --cors --ctx 32768 --vision ${DWARFSTAR_DIR}/gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf --dspark --mtp-model ${DWARFSTAR_DIR}/gguf/DeepSeek-V4-Flash-Vision-Exp-DSpark-support.gguf --kv-disk-dir ~/.ds4/dwarfstar-runner/kv/ds4vision-q2 --kv-disk-space-mb 8192 --threads 8 >> ~/.ds4/dwarfstar-runner/logs/ds4vision-q2.log 2>&1'
 ENV DS4_LOCK_FILE=/tmp/ds4-gpu.lock
 ENV MODELS=deepseek-v4-flash-vision,deepseek-v4-flash-vision-q2
+ENV WEIGHTS=${DWARFSTAR_DIR}/gguf/DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf,${DWARFSTAR_DIR}/gguf/DeepSeek-V4-Flash-Vision-Encoder.gguf,${DWARFSTAR_DIR}/gguf/DeepSeek-V4-Flash-Vision-Exp-DSpark-support.gguf
 HEALTHCHECK http://127.0.0.1:8894/v1/models
 RESTART no

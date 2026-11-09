@@ -8,5 +8,6 @@ SERVICE glm53flash-q4
 RUN bash -c 'mkdir -p ~/.ds4/dwarfstar-runner/logs && cd ${DWARFSTAR_DIR} && exec nice -n 10 ${DWARFSTAR_DIR}/ds4-server --model ${DWARFSTAR_DIR}/gguf/GLM-5.3-Flash-Q4_K.gguf --host 0.0.0.0 --port 8902 --cors --backend metal --ctx 32768 --ssd-streaming --kv-disk-dir ~/.ds4/dwarfstar-runner/kv/glm53flash-q4 --kv-disk-space-mb 8192 --threads 8 >> ~/.ds4/dwarfstar-runner/logs/glm53flash-q4.log 2>&1'
 ENV DS4_LOCK_FILE=/tmp/ds4-gpu.lock
 ENV MODELS=glm-5.3-flash-q4
+ENV WEIGHTS=${DWARFSTAR_DIR}/gguf/GLM-5.3-Flash-Q4_K.gguf
 HEALTHCHECK http://127.0.0.1:8902/v1/models
 RESTART no
