@@ -8,12 +8,10 @@ ORCHD=${ORCHD:-$HOME/.local/bin/orchd}
 [ -x "$ORCHD" ] || ORCHD=orchd
 state_root=${STATE_ROOT:-$HOME/.orch/g}
 
-# The models share one grove, made of every Orchfile in servers/: the first is
-# the base and the rest are overlays.
-set --
+# The models share one grove: the Orchfile, with any servers/*.orch laid over it.
+set -- --orchfile "$ROOT/Orchfile"
 for f in "$ROOT"/servers/*.orch; do
-    [ -e "$f" ] || continue
-    if [ $# -eq 0 ]; then set -- --orchfile "$f"; else set -- "$@" --overlay "$f"; fi
+    [ -e "$f" ] && set -- "$@" --overlay "$f"
 done
 
 # Fell it with its Orchfiles, or without them when they no longer resolve.

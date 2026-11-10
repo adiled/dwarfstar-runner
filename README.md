@@ -20,7 +20,7 @@ as running out of GPU memory, or when the disk holding the models runs low.
 `./watch --test` sends one to check that notifications reach you. Its
 thresholds are the `WATCH_*` ARGs in `arbiter.orch`.
 
-The templates run ds4 from the checkout in `DWARFSTAR_DIR`, which defaults to
+The models run ds4 from the checkout in `DWARFSTAR_DIR`, which defaults to
 `~/ds4`. If yours is elsewhere, pass it when you start the front door:
 
 ```sh
@@ -34,29 +34,23 @@ once per `./run`. `ORCH_ARG_<name>` is orch's way to override any Orchfile
 The runner keeps its own files under `~/.ds4/dwarfstar-runner`, beside ds4's
 saved sessions in `~/.ds4/kvcache`:
 
-- `logs/<template>.log`, `logs/arbiter.log` and `logs/watch.log`: each
+- `logs/<service>.log`, `logs/arbiter.log` and `logs/watch.log`: each
   server's, the arbiter's and the watch's output.
-- `kv/<template>/`: each model's disk KV cache, capped by the template's
-  `--kv-disk-space-mb`. A vision template shares its text sibling's cache.
+- `kv/<service>/`: each model's disk KV cache, capped by the service's
+  `--kv-disk-space-mb`. A vision model shares its text sibling's cache.
 
 A server that fails before ds4 starts, for instance on a wrong
 `DWARFSTAR_DIR`, reports it in orchd's own log instead:
-`~/.orch/g/dwarfstar/logs/<template>.err`.
+`~/.orch/g/dwarfstar/logs/<service>.err`.
 
-The front door reads its roster from `servers/`. The repository ships examples in
-`servers-template/`, and on a fresh clone `servers/` is empty, so `./run` will
-exit with `no specs matched`. Link every template in, or copy the ones you want:
+The front door reads its roster from the `Orchfile`, which has one `SERVICE`
+per model. A model is advertised only while every file in its `ENV WEIGHTS` is
+on disk, so models appear as you download them. A request for one whose files
+are missing gets a 404 naming the absent file.
 
-```sh
-for f in servers-template/*.orch; do ln -s "../$f" servers/; done
-cp servers-template/ds4server.orch servers/
-```
-
-A template is advertised only while every file in its `ENV WEIGHTS` is on disk,
-so models appear as you download them. A request for one whose files are
-missing gets a 404 naming the absent file.
-
-Or bring in an Orchfile you keep elsewhere:
+To add a model of your own, or change a shipped one, without editing the
+`Orchfile`, put an Orchfile in `servers/`. Git ignores that directory, and every
+`servers/*.orch` is laid over the `Orchfile`:
 
 ```sh
 ln -s ~/my-models/llama.orch servers/llama.orch
@@ -66,9 +60,9 @@ Start once, then point any OpenAI client at `http://127.0.0.1:8899/v1` and name 
 model. That address is the only one a client needs to know. Models appear and
 disappear as requests arrive, so there are no per-model commands to run.
 
-## Templates
+## Models
 
-One template per DwarfStar download, set up for a 128 GB Apple Silicon Mac.
+One service per DwarfStar download, set up for a 128 GB Apple Silicon Mac.
 Each runs `${DWARFSTAR_DIR}/ds4-server` with its GGUFs under
 `${DWARFSTAR_DIR}/gguf/`; fetch a model with `./download_model.sh <target>` in
 the ds4 checkout. *Resident* models are held
@@ -77,7 +71,7 @@ SSD (`--ssd-streaming`). Speculative decoding is on wherever the model supports
 it with a resident target: DSpark for V4 Flash, the built-in MTP block for GLM
 and Qwen.
 
-| Template | Model ids | ds4 download target | Mode | Port |
+| Service | Model ids | ds4 download target | Mode | Port |
 |---|---|---|---|---|
 | `ds4server` | `deepseek-v4-flash` | `ds4f-q2-q4`, `ds4f-dspark` | resident, DSpark | 8888 |
 | `ds4flash-q2` | `deepseek-v4-flash-iq2` | `ds4f-q2`, `ds4f-dspark` | resident, DSpark | 8890 |
@@ -104,19 +98,19 @@ and Qwen.
 | `qwen38-q2` | `qwen3.8-flash-next-q2` | `qwen38-q2` | resident, MTP | 8909 |
 | `qwen38-q4k-vision` | `qwen3.8-flash-next-vision` | `qwen38-q4k`, `qwen38-vision` | resident, MTP, vision | 8911 |
 
-Model ids are unique across templates because the arbiter answers with the
-first file, in name order, that lists the id.
+Model ids are unique across services because the arbiter answers with the
+first service, in file order, that lists the id.
 
 The `-chat` and `-reasoner` ids pick thinking per request: ds4-server turns
 thinking off for `glm-5.3-flash-chat` and on for `glm-5.3-flash-reasoner`, and
 leaves its default (on) for the plain id. A request's own `thinking`,
 `reasoning_effort` or `think` field takes precedence over the id.
 
-A vision template loads the same weights as its text sibling plus an encoder,
+A vision service loads the same weights as its text sibling plus an encoder,
 so the pair cannot run together; the shared lock keeps one at a time.
 
-Templates run without `--batched-session`, which turns DSpark and MTP off. Add
-it to a template when several clients share one model at once.
+Services run without `--batched-session`, which turns DSpark and MTP off. Add
+it to a service when several clients share one model at once.
 
 ### GPU memory for resident models
 
@@ -133,20 +127,16 @@ room for the system. It is a ceiling, not a reservation.
 
 ## Adapting it to your use case
 
-The front door accepts any server that follows the conventions below. The
-directory `servers/` is ignored by git, so the Orchfiles in it are yours to
-arrange however you like.
+The front door accepts any server that follows the conventions below, whether
+it is a `SERVICE` in the `Orchfile` or in a file of your own under `servers/`.
 
-- The arbiter globs `servers/*.orch`, so the directory and the extension are
-  fixed.
-- It reads the first service in the file, so keep one service per Orchfile. A
-  second service in the file would be planted by orchd and remain invisible to
-  the arbiter.
-- Give every service its own name. The files are merged into one grove, and
-  two files that name the same service become one service.
-- A file that does not resolve on its own is left out of the roster. The
-  arbiter reads `servers/` when it starts, so run `./stop` and `./run` after
-  adding or removing a file.
+- Every service is a model, so give each its own name. A service in
+  `servers/` with the name of one in the `Orchfile` changes that one.
+- Set `DISABLED true`. orchd then starts the service only when the arbiter
+  names it. Without it, launchd starts the service at every login.
+- A file in `servers/` that does not validate over the `Orchfile` is left out
+  of the roster. The arbiter reads the roster when it starts, so run `./stop`
+  and `./run` after a change.
 - The `RUN` line must contain `--port N`. The arbiter reads the port from that
   flag and connects to `127.0.0.1:N`.
 - Set `HEALTHCHECK` to a URL that answers 200 once the service is ready. Without
@@ -164,7 +154,7 @@ The services must answer an OpenAI request, because the arbiter relays the body
 unchanged and reads the `model` field from it. Anything that accepts
 `POST /v1/chat/completions` with a `model` key will work.
 
-Two settings of one model become two Orchfiles. The weights stay on disk once,
+Two settings of one model become two services. The weights stay on disk once,
 and the shared lock keeps the pair from running together.
 
 The front door enforces one holder across the whole roster. Every switch stops
@@ -181,16 +171,13 @@ Orchfile](https://github.com/adiled/orchd#write-an-orchfile), and the model that
 gives it its vocabulary of groves, sow, plant and tend is described in [The
 Orchard Model](https://github.com/adiled/orchd/blob/main/ORCHARD.md).
 
-Each model here has its own Orchfile in `servers/`. The arbiter reads that
-directory, resolves every Orchfile with `orch resolve --json`, and treats the
-result as the roster, so the available models are the files that are present.
+Each model here is a `SERVICE` in the `Orchfile`. The arbiter resolves it with
+`orch resolve --json` and treats the services as the roster.
 
 All the models share one grove, named `dwarfstar`, with its state in
-`~/.orch/g/dwarfstar`.
-The arbiter hands orchd the first Orchfile as the base and the rest as
-overlays, so orchd sees one spec with a service per model. `orchd grow <model>`
-starts one of them and `orchd fell <model>` stops one, and the rest of the
-grove is left alone.
+`~/.orch/g/dwarfstar`. `orchd grow <model>` starts one of them and
+`orchd fell <model>` stops one, and the rest of the grove is left alone. Every
+service is `DISABLED`, so none starts unless it is named.
 
 The arbiter runs in its own grove, `ctl`, beside the watch and apart from the
 models. For each request it resolves the model name, asks `orchd survey` which
@@ -200,12 +187,12 @@ relays the request to that model's port. One switch runs at a time. Response
 streams pass through unchanged, and every connection forks its own process so a
 long switch cannot hold up other clients.
 
-The public interface is OpenAI's `/v1`. The `ENV MODELS` line in each Orchfile
+The public interface is OpenAI's `/v1`. The `ENV MODELS` line in each service
 lists the names its model answers to, and `ENV WEIGHTS` the files it needs. Both
 are ordinary `ENV` directives, set in the server's environment like any other,
 that the arbiter also reads from `orch resolve --json`.
 
-ds4 holds an exclusive lock on `DS4_LOCK_FILE`, and every Orchfile points at the
+ds4 holds an exclusive lock on `DS4_LOCK_FILE`, and every service points at the
 same file. One model can hold the GPU at a time, whichever way it was started.
 The arbiter stops the current model before it starts the next, which keeps the
 lock free during normal use.

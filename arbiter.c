@@ -5,21 +5,20 @@
  * model is serving without ever killing a process by hand. It is a pure client
  * of the orch toolchain:
  *
- *   roster : `orch resolve --json servers/<name>.orch` (name, port, health)
+ *   roster : `orch resolve --json Orchfile`            (name, port, health)
  *   holder : `orchd ... --grove dwarfstar survey --json`
  *   start  : `orchd ... --grove dwarfstar grow <name>`
  *   stop   : `orchd ... --grove dwarfstar fell <name> --keep-data`
  *
- * A spec's ENV MODELS lists the ids its model answers to, and ENV WEIGHTS the
+ * A service's ENV MODELS lists the ids its model answers to, and ENV WEIGHTS the
  * files its server cannot start without. Both are plain ENV directives that
  * the arbiter reads from `orch resolve --json`. A model whose weights are not
  * all on disk is neither advertised nor raised.
  *
- * Every model is a tree in one grove. The Orchfiles in servers/ are merged,
- * the first as the base and the rest as overlays, so orchd sees one spec with
- * a service per model. `grow <name>` starts one tree and `fell <name>` stops
- * one, and the rest of the grove stands. The arbiter lives in its own grove,
- * so nothing it fells can stop the arbiter.
+ * Every model is a SERVICE in the Orchfile and a tree in one grove.
+ * `grow <name>` starts one tree and `fell <name>` stops one, and the rest of
+ * the grove stands. Any .orch file in servers/ is laid over the Orchfile. The
+ * arbiter lives in its own grove, so nothing it fells can stop the arbiter.
  *
  * The GPU itself is still guarded by ds4's own flock: every model spec sets the
  * same DS4_LOCK_FILE, so at most one model ever runs.
@@ -63,7 +62,6 @@
 
 typedef struct {
     char name[128];
-    char file[PATH_MAX];
     char host[256];
     int  port;
     char health[512];
@@ -78,7 +76,7 @@ static char g_dir[PATH_MAX];
 static char g_orch[PATH_MAX];
 static char g_orchd[PATH_MAX];
 static char g_state_root[PATH_MAX];
-static char *g_files;   /* "--orchfile 'a' --overlay 'b' ...": the merged spec */
+static char *g_files;   /* "--orchfile 'Orchfile' --overlay 'x' ...": the spec */
 static char g_listen_host[128] = "127.0.0.1";
 static int  g_listen_port = 8899;
 static int  g_timeout = 900;
@@ -179,53 +177,111 @@ static int port_from_cmd(const char *cmd) {
     return 0;
 }
 
-static int discover(char *err, size_t errn) {
-    char pattern[PATH_MAX];
-    snprintf(pattern, sizeof pattern, "%s/servers/*.orch", g_dir);
+typedef struct { char *buf; size_t len, cap; } sbuf_t;
 
-    glob_t gl;
-    if (glob(pattern, 0, NULL, &gl) != 0) {
-        snprintf(err, errn, "no specs matched %s", pattern);
+static void sb_add(sbuf_t *s, const char *fmt, ...) {
+    for (;;) {
+        va_list ap;
+        va_start(ap, fmt);
+        int n = s->buf ? vsnprintf(s->buf + s->len, s->cap - s->len, fmt, ap) : -1;
+        va_end(ap);
+        if (s->buf && n >= 0 && (size_t)n < s->cap - s->len) {
+            s->len += (size_t)n;
+            return;
+        }
+        if (s->buf && n < 0) return;
+        size_t cap = s->cap ? s->cap * 2 : 1024;
+        char *tmp = realloc(s->buf, cap);
+        if (!tmp) return;
+        s->buf = tmp;
+        s->cap = cap;
+    }
+}
+
+/* Append a shell-quoted word, with a flag before it if given. */
+static void add_word(sbuf_t *s, const char *flag, const char *word) {
+    sb_add(s, "%s%s%s'%s'", s->len ? " " : "", flag ? flag : "",
+           flag ? " " : "", word);
+}
+
+/*
+ * Read the roster. The spec is the Orchfile, plus every .orch file in
+ * servers/ laid over it: a place for models of your own, or for changes to a shipped one.
+ * An overlay that does not validate over the Orchfile is left out, so it
+ * cannot take the roster down with it.
+ */
+static int discover(char *err, size_t errn) {
+    char base[PATH_MAX];
+    snprintf(base, sizeof base, "%s/Orchfile", g_dir);
+    if (access(base, R_OK) != 0) {
+        snprintf(err, errn, "cannot read %s", base);
         return -1;
     }
 
-    /* Room for every file as an --orchfile/--overlay argument. */
-    size_t fcap = 1, flen = 0;
-    for (size_t i = 0; i < gl.gl_pathc; i++)
-        fcap += strlen(gl.gl_pathv[i]) + 16;
-    g_files = malloc(fcap);
-    if (!g_files) { globfree(&gl); snprintf(err, errn, "out of memory"); return -1; }
-    g_files[0] = '\0';
+    sbuf_t flags = {0}, files = {0};
+    add_word(&flags, "--orchfile", base);
+    add_word(&files, NULL, base);
 
-    for (size_t i = 0; i < gl.gl_pathc && nmodels < MAX_MODELS; i++) {
-        const char *file = gl.gl_pathv[i];
-        char cmd[PATH_MAX * 3];
-        snprintf(cmd, sizeof cmd, "'%s' resolve --json '%s' 2>/dev/null", g_orch, file);
+    char pattern[PATH_MAX];
+    snprintf(pattern, sizeof pattern, "%s/servers/*.orch", g_dir);
+    glob_t gl;
+    if (glob(pattern, 0, NULL, &gl) == 0) {
+        for (size_t i = 0; i < gl.gl_pathc; i++) {
+            const char *file = gl.gl_pathv[i];
+            char cmd[PATH_MAX * 3];
+            snprintf(cmd, sizeof cmd, "'%s' validate '%s' '%s' >/dev/null 2>&1",
+                     g_orch, base, file);
+            if (run_status(cmd) != 0) {
+                logf_("%s does not validate over the Orchfile, left out", file);
+                continue;
+            }
+            add_word(&flags, "--overlay", file);
+            add_word(&files, NULL, file);
+        }
+        globfree(&gl);
+    }
+    if (!flags.buf || !files.buf) {
+        snprintf(err, errn, "out of memory");
+        return -1;
+    }
+    g_files = flags.buf;
 
-        char *json = NULL;
-        if (run_capture(cmd, &json) != 0 || !json) { free(json); continue; }
+    size_t n = strlen(g_orch) + files.len + 64;
+    char *cmd = malloc(n);
+    if (!cmd) { snprintf(err, errn, "out of memory"); return -1; }
+    snprintf(cmd, n, "'%s' resolve --json %s 2>/dev/null", g_orch, files.buf);
+    free(files.buf);
 
-        char *name = json_get_string(json, "services[0].name");
-        char *run  = json_get_string(json, "services[0].run_command");
-        char *hc   = json_get_string(json, "services[0].healthcheck");
-        char *ids  = json_get_string(json, "services[0].env.MODELS");
-        char *wts  = json_get_string(json, "services[0].env.WEIGHTS");
+    char *json = NULL;
+    int rc = run_capture(cmd, &json);
+    free(cmd);
+    if (rc != 0 || !json) {
         free(json);
+        snprintf(err, errn, "%s does not resolve; try `orch validate` on it", base);
+        return -1;
+    }
 
-        if (!name || !run) {
-            free(name); free(run); free(hc); free(ids); free(wts);
+    for (int i = 0; nmodels < MAX_MODELS; i++) {
+        char path[64];
+        snprintf(path, sizeof path, "services[%d].name", i);
+        char *name = json_get_string(json, path);
+        if (!name) break;
+        snprintf(path, sizeof path, "services[%d].run_command", i);
+        char *run  = json_get_string(json, path);
+        snprintf(path, sizeof path, "services[%d].healthcheck", i);
+        char *hc   = json_get_string(json, path);
+        snprintf(path, sizeof path, "services[%d].env.MODELS", i);
+        char *ids  = json_get_string(json, path);
+        snprintf(path, sizeof path, "services[%d].env.WEIGHTS", i);
+        char *wts  = json_get_string(json, path);
+
+        if (!run) {
+            free(name); free(hc); free(ids); free(wts);
             continue;
         }
 
-        /* A file that resolves on its own joins the merged spec; one that
-         * does not is left out, so it cannot take the roster down with it. */
-        flen += (size_t)snprintf(g_files + flen, fcap - flen, "%s%s '%s'",
-                                 nmodels ? " " : "",
-                                 nmodels ? "--overlay" : "--orchfile", file);
-
         model_t *m = &models[nmodels++];
         snprintf(m->name, sizeof m->name, "%s", name);
-        snprintf(m->file, sizeof m->file, "%s", file);
         snprintf(m->host, sizeof m->host, "127.0.0.1");
         m->port = port_from_cmd(run);
 
@@ -253,10 +309,10 @@ static int discover(char *err, size_t errn) {
 
         free(name); free(run); free(hc); free(ids); free(wts);
     }
-    globfree(&gl);
+    free(json);
 
     if (nmodels == 0) {
-        snprintf(err, errn, "no services with a port under %s/servers", g_dir);
+        snprintf(err, errn, "no services in %s", base);
         return -1;
     }
     return 0;
@@ -556,22 +612,6 @@ static void proxy_to(int cfd, int ti, const char *path,
 }
 
 /* --- HTTP --------------------------------------------------------------- */
-
-typedef struct { char *buf; size_t len, cap; } sbuf_t;
-
-static void sb_add(sbuf_t *s, const char *fmt, ...) {
-    if (s->cap - s->len < 256) {
-        s->cap = s->cap ? s->cap * 2 : 1024;
-        char *tmp = realloc(s->buf, s->cap);
-        if (!tmp) return;
-        s->buf = tmp;
-    }
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(s->buf + s->len, s->cap - s->len, fmt, ap);
-    va_end(ap);
-    if (n > 0) s->len += (size_t)n;
-}
 
 static void send_all(int fd, int code, const char *reason, const char *body) {
     char hdr[256];

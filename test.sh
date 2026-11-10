@@ -32,9 +32,9 @@ note()  { printf '\n%s\n' "$1"; }
 command -v "$WME" >/dev/null 2>&1 || { echo "test.sh: $WME is not in PATH" >&2; exit 2; }
 command -v jq >/dev/null 2>&1   || { echo "test.sh: jq is not in PATH" >&2; exit 2; }
 
-# Ports declared by the model specs, one per model.
+# Ports declared by the services, one per model.
 model_ports() {
-    grep -h -o -E -- '--port [0-9]+' servers/*.orch 2>/dev/null | awk '{print $2}' | sort -n
+    cat Orchfile servers/*.orch 2>/dev/null | grep -o -E -- '--port [0-9]+' | awk '{print $2}' | sort -n
 }
 
 # Which of those ports is listening right now.
