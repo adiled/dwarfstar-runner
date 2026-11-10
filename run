@@ -15,4 +15,4 @@ state_root=${STATE_ROOT:-$HOME/.orch/g}
 [ -x "$ROOT/arbiter" ] || make -C "$ROOT"
 
 "$ORCHD" --project-dir "$ROOT" --state-dir "$state_root/ctl" \
-         --orchfile "$ROOT/arbiter.orch" --namespace ctl --user grow
+         --orchfile "$ROOT/arbiter.orch" --grove ctl --user grow

@@ -6,6 +6,10 @@ ORCH_VERSION 1.0.0-rc
 # `ORCH_ARG_DWARFSTAR_DIR=/path ./run`.
 ARG DWARFSTAR_DIR=~/ds4
 
+# Where this repository is checked out. orchd passes the real project
+# directory on `grow`; the default lets the file resolve on its own.
+ARG ORCH_PROJECT=~/ds4-runner
+
 # When the watch raises "Watch out! Dwarfstar is cooking ...": seconds between
 # checks, swap growth since a model loaded, and free disk where models live.
 ARG WATCH_INTERVAL=15
