@@ -5,22 +5,23 @@
  * model is serving without ever killing a process by hand. It is a pure client
  * of the orch toolchain:
  *
- *   roster : `orch resolve --json Orchfile`            (name, port, health)
- *   holder : `orchd ... --grove dwarfstar survey --json`
- *   start  : `orchd ... --grove dwarfstar grow <name>`
- *   stop   : `orchd ... --grove dwarfstar fell <name> --keep-data`
+ *   roster : `orch resolve --json Orchfile`   (name, ids, weights, health)
+ *   holder : `orchd survey --json`
+ *   start  : `orchd grow <name>`
+ *   stop   : `orchd fell <name> --keep-data`
  *
- * A service's ENV MODELS lists the ids its model answers to, and ENV WEIGHTS the
- * files its server cannot start without. Both are plain ENV directives that
- * the arbiter reads from `orch resolve --json`. A model whose weights are not
- * all on disk is neither advertised nor raised.
+ * The Orchfile holds the whole runner in one grove: this arbiter, the watch,
+ * and a SERVICE per model. A service is a model when it sets ENV MODELS, the
+ * ids it answers to. ENV WEIGHTS lists the files its server cannot start
+ * without; a model whose weights are not all on disk is neither advertised
+ * nor raised. HEALTHCHECK is the URL the model answers on.
  *
- * Every model is a SERVICE in the Orchfile and a tree in one grove.
+ * Models are DISABLED, so orchd starts one only when it is named.
  * `grow <name>` starts one tree and `fell <name>` stops one, and the rest of
- * the grove stands. Any .orch file in servers/ is laid over the Orchfile. The
- * arbiter lives in its own grove, so nothing it fells can stop the arbiter.
+ * the grove stands, the arbiter included. Any .orch file in servers/ is laid
+ * over the Orchfile. The grove and scope come from .orchrc beside it.
  *
- * The GPU itself is still guarded by ds4's own flock: every model spec sets the
+ * The GPU itself is still guarded by ds4's own flock: every model sets the
  * same DS4_LOCK_FILE, so at most one model ever runs.
  *
  *   GET  /v1/models       -> every advertised id
@@ -57,7 +58,6 @@
 #endif
 
 #define MAX_MODELS 64
-#define GROVE "dwarfstar" /* the one grove every model is planted into */
 #define RECV_MAX 65536
 
 typedef struct {
@@ -75,8 +75,8 @@ static int     nmodels = 0;
 static char g_dir[PATH_MAX];
 static char g_orch[PATH_MAX];
 static char g_orchd[PATH_MAX];
-static char g_state_root[PATH_MAX];
-static char *g_files;   /* "--orchfile 'Orchfile' --overlay 'x' ...": the spec */
+static char g_state_dir[PATH_MAX];
+static char *g_overlays;   /* "--overlay 'x' ...", or "" */
 static char g_listen_host[128] = "127.0.0.1";
 static int  g_listen_port = 8899;
 static int  g_timeout = 900;
@@ -165,18 +165,6 @@ static int weights_present(const char *weights, char *missing, size_t missingn) 
     return 1;
 }
 
-/* Extract the first "--port N" from a run command. */
-static int port_from_cmd(const char *cmd) {
-    const char *p = cmd;
-    while ((p = strstr(p, "--port")) != NULL) {
-        const char *q = p + 6;
-        while (*q == ' ' || *q == '=') q++;
-        if (isdigit((unsigned char)*q)) return atoi(q);
-        p = q;
-    }
-    return 0;
-}
-
 typedef struct { char *buf; size_t len, cap; } sbuf_t;
 
 static void sb_add(sbuf_t *s, const char *fmt, ...) {
@@ -205,10 +193,11 @@ static void add_word(sbuf_t *s, const char *flag, const char *word) {
 }
 
 /*
- * Read the roster. The spec is the Orchfile, plus every .orch file in
- * servers/ laid over it: a place for models of your own, or for changes to a shipped one.
- * An overlay that does not validate over the Orchfile is left out, so it
- * cannot take the roster down with it.
+ * Read the roster: every service that sets ENV MODELS. The spec is the
+ * Orchfile, plus every .orch file in servers/ laid over it: a place for
+ * models of your own, or for changes to a shipped one. An overlay that does
+ * not validate over the Orchfile is left out, so it cannot take the roster
+ * down with it.
  */
 static int discover(char *err, size_t errn) {
     char base[PATH_MAX];
@@ -219,7 +208,6 @@ static int discover(char *err, size_t errn) {
     }
 
     sbuf_t flags = {0}, files = {0};
-    add_word(&flags, "--orchfile", base);
     add_word(&files, NULL, base);
 
     char pattern[PATH_MAX];
@@ -240,11 +228,11 @@ static int discover(char *err, size_t errn) {
         }
         globfree(&gl);
     }
-    if (!flags.buf || !files.buf) {
+    if (!files.buf) {
         snprintf(err, errn, "out of memory");
         return -1;
     }
-    g_files = flags.buf;
+    g_overlays = flags.buf ? flags.buf : "";
 
     size_t n = strlen(g_orch) + files.len + 64;
     char *cmd = malloc(n);
@@ -266,53 +254,41 @@ static int discover(char *err, size_t errn) {
         snprintf(path, sizeof path, "services[%d].name", i);
         char *name = json_get_string(json, path);
         if (!name) break;
-        snprintf(path, sizeof path, "services[%d].run_command", i);
-        char *run  = json_get_string(json, path);
-        snprintf(path, sizeof path, "services[%d].healthcheck", i);
-        char *hc   = json_get_string(json, path);
         snprintf(path, sizeof path, "services[%d].env.MODELS", i);
         char *ids  = json_get_string(json, path);
+        snprintf(path, sizeof path, "services[%d].healthcheck", i);
+        char *hc   = json_get_string(json, path);
         snprintf(path, sizeof path, "services[%d].env.WEIGHTS", i);
         char *wts  = json_get_string(json, path);
 
-        if (!run) {
-            free(name); free(hc); free(ids); free(wts);
+        /* No ENV MODELS: not a model. The arbiter and the watch are these. */
+        if (!ids || !ids[0]) {
+            free(name); free(ids); free(hc); free(wts);
             continue;
         }
 
-        model_t *m = &models[nmodels++];
-        snprintf(m->name, sizeof m->name, "%s", name);
-        snprintf(m->host, sizeof m->host, "127.0.0.1");
-        m->port = port_from_cmd(run);
-
-        if (hc && hc[0]) {
-            snprintf(m->health, sizeof m->health, "%s", hc);
-            /* The health URL carries the address the server answers on, so it
-             * takes precedence over the port scraped from the run command. */
-            char hpath[512];
-            int hport = 0;
-            if (parse_url(hc, m->host, sizeof m->host, &hport, hpath, sizeof hpath) == 0) {
-                if (hport > 0) m->port = hport;
-            } else {
-                logf_("%s: health URL is not plain HTTP, falling back to %s:%d",
-                      name, m->host, m->port);
-            }
-        } else {
-            snprintf(m->health, sizeof m->health,
-                     "http://%s:%d/v1/models", m->host, m->port);
+        /* The health URL is the address the model answers on. */
+        model_t *m = &models[nmodels];
+        char hpath[512];
+        if (!hc || parse_url(hc, m->host, sizeof m->host, &m->port,
+                             hpath, sizeof hpath) != 0) {
+            logf_("%s: HEALTHCHECK must be an http:// URL, left out", name);
+            free(name); free(ids); free(hc); free(wts);
+            continue;
         }
-        /* Model ids the front door advertises for this model: ENV MODELS if
-         * set, else the service name. */
-        snprintf(m->ids, sizeof m->ids, "%s", (ids && ids[0]) ? ids : name);
+        nmodels++;
+        snprintf(m->name, sizeof m->name, "%s", name);
+        snprintf(m->health, sizeof m->health, "%s", hc);
+        snprintf(m->ids, sizeof m->ids, "%s", ids);
         /* Files the server cannot start without: ENV WEIGHTS, if set. */
         snprintf(m->weights, sizeof m->weights, "%s", wts ? wts : "");
 
-        free(name); free(run); free(hc); free(ids); free(wts);
+        free(name); free(ids); free(hc); free(wts);
     }
     free(json);
 
     if (nmodels == 0) {
-        snprintf(err, errn, "no services in %s", base);
+        snprintf(err, errn, "no service in %s sets ENV MODELS", base);
         return -1;
     }
     return 0;
@@ -404,15 +380,13 @@ static int http_ok(const char *url) {
 
 /* --- the grove ---------------------------------------------------------- */
 
-/* Build `orchd <grove flags> [the merged spec] <tail>`. Caller frees. */
-static char *orchd_cmd(int with_files, const char *tail) {
-    size_t n = PATH_MAX * 4 + strlen(g_files) + strlen(tail);
+/* Build `orchd <where> [overlays] <tail>`. Caller frees. */
+static char *orchd_cmd(const char *tail) {
+    size_t n = PATH_MAX * 4 + strlen(g_overlays) + strlen(tail);
     char *cmd = malloc(n);
     if (!cmd) return NULL;
-    snprintf(cmd, n,
-             "'%s' --project-dir '%s' --state-dir '%s/" GROVE "' %s "
-             "--grove " GROVE " --user %s",
-             g_orchd, g_dir, g_state_root, with_files ? g_files : "", tail);
+    snprintf(cmd, n, "'%s' --project-dir '%s' --state-dir '%s' %s %s",
+             g_orchd, g_dir, g_state_dir, g_overlays, tail);
     return cmd;
 }
 
@@ -420,7 +394,7 @@ static char *orchd_cmd(int with_files, const char *tail) {
 static void tree_grow(const char *name) {
     char tail[256];
     snprintf(tail, sizeof tail, "grow '%s'", name);
-    char *cmd = orchd_cmd(1, tail);
+    char *cmd = orchd_cmd(tail);
     if (cmd) run_status(cmd);
     free(cmd);
 }
@@ -429,7 +403,7 @@ static void tree_grow(const char *name) {
 static void tree_fell(const char *name) {
     char tail[256];
     snprintf(tail, sizeof tail, "fell '%s' --keep-data", name);
-    char *cmd = orchd_cmd(1, tail);
+    char *cmd = orchd_cmd(tail);
     if (cmd) run_status(cmd);
     free(cmd);
 }
@@ -455,7 +429,7 @@ typedef struct { char name[128]; int pid; } tree_t;
  * Fills out with the live trees and returns how many there are.
  */
 static int survey_live(tree_t *out, int max) {
-    char *cmd = orchd_cmd(0, "survey --json 2>/dev/null");
+    char *cmd = orchd_cmd("survey --json 2>/dev/null");
     if (!cmd) return 0;
     char *json = NULL;
     int rc = run_capture(cmd, &json);
@@ -502,14 +476,14 @@ static int switch_to(const char *name, int timeout, char *err, size_t errn) {
     /* Every connection is its own process and all of them share one grove,
      * so one switch runs at a time. The lock goes when the fd closes. */
     char lock[PATH_MAX];
-    snprintf(lock, sizeof lock, "%s/" GROVE ".lock", g_state_root);
-    int lfd = open(lock, O_CREAT | O_RDWR, 0644);
+    snprintf(lock, sizeof lock, "%s/Orchfile", g_dir);
+    int lfd = open(lock, O_RDONLY);
     if (lfd >= 0) flock(lfd, LOCK_EX);
 
     int port = -1;
 
-    /* orchd is the source of truth for who is running: fell every other tree
-     * it reports with a live PID. */
+    /* orchd is the source of truth for who is running: fell every other
+     * model it reports with a live PID. */
     tree_t live[MAX_MODELS];
     int n = survey_live(live, MAX_MODELS);
     int held = 0;
@@ -524,6 +498,7 @@ static int switch_to(const char *name, int timeout, char *err, size_t errn) {
 
     for (int i = 0; i < n; i++) {
         if (strcmp(live[i].name, models[ti].name) == 0) continue;
+        if (find_model(live[i].name) < 0) continue;   /* arbiter, watch */
         logf_("stopping holder %s (pid %d)", live[i].name, live[i].pid);
         tree_fell(live[i].name);
     }
@@ -805,7 +780,7 @@ static int serve(void) {
 
     logf_("arbiter on http://%s:%d", g_listen_host, g_listen_port);
     logf_("orch: %s   orchd: %s", g_orch, g_orchd);
-    logf_("grove: " GROVE "   state: %s/" GROVE "   dir: %s", g_state_root, g_dir);
+    logf_("state: %s   dir: %s", g_state_dir, g_dir);
     for (int i = 0; i < nmodels; i++)
         logf_("  %-22s :%-6d %s", models[i].name, models[i].port, models[i].health);
 
@@ -843,7 +818,7 @@ int main(int argc, char **argv) {
     v = arg_val(argc, argv, "--dir");        expand_tilde(v ? v : ".", g_dir, sizeof g_dir);
     v = arg_val(argc, argv, "--orch");       expand_tilde(v ? v : "orch", g_orch, sizeof g_orch);
     v = arg_val(argc, argv, "--orchd");      expand_tilde(v ? v : "orchd", g_orchd, sizeof g_orchd);
-    v = arg_val(argc, argv, "--state-root"); expand_tilde(v ? v : "~/.orch/g", g_state_root, sizeof g_state_root);
+    v = arg_val(argc, argv, "--state-dir");  expand_tilde(v ? v : "~/.orch/g/dwarfstar", g_state_dir, sizeof g_state_dir);
 
     v = arg_val(argc, argv, "--listen");
     if (v) {
