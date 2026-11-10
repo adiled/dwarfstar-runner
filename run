@@ -3,16 +3,32 @@
 #
 # Then point a client at http://127.0.0.1:8899/v1 and name a model. The front
 # door owns the GPU and swaps the holder under a single lock. To stop
-# everything, run ./stop. Power users can drive `orchd` directly.
+# everything, run ./stop. Power users can drive `orchd` directly; .orchrc
+# names the grove.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 ORCHD=${ORCHD:-$HOME/.local/bin/orchd}
 [ -x "$ORCHD" ] || ORCHD=orchd
-state_root=${STATE_ROOT:-$HOME/.orch/g}
+ORCH=${ORCH:-$HOME/.local/bin/orch}
+[ -x "$ORCH" ] || ORCH=orch
+STATE_DIR=${STATE_DIR:-$HOME/.orch/g/dwarfstar}
 
 [ -x "$ROOT/arbiter" ] || make -C "$ROOT"
+mkdir -p "$HOME/.ds4/dwarfstar-runner/logs"
 
-"$ORCHD" --project-dir "$ROOT" --state-dir "$state_root/ctl" \
-         --orchfile "$ROOT/arbiter.orch" --grove ctl --user grow
+# The Orchfile, with any servers/*.orch laid over it. One that does not
+# validate is left out, as the arbiter leaves it out.
+set --
+for f in "$ROOT"/servers/*.orch; do
+    [ -e "$f" ] || continue
+    if "$ORCH" validate "$ROOT/Orchfile" "$f" >/dev/null 2>&1; then
+        set -- "$@" --overlay "$f"
+    else
+        echo "run: $f does not validate over the Orchfile, left out" >&2
+    fi
+done
+
+# Models are DISABLED, so this starts the arbiter and the watch only.
+"$ORCHD" --project-dir "$ROOT" --state-dir "$STATE_DIR" "$@" grow

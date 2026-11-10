@@ -5,7 +5,7 @@
 # where the models live. It notifies when a condition begins or escalates,
 # quietly when it clears, and repeats a log alert at most every ten minutes.
 #
-# Runs as the `watch` service of arbiter.orch and logs to
+# Runs as the `watch` service of the Orchfile and logs to
 # ~/.ds4/dwarfstar-runner/logs/watch.log. Needs no sudo; adds GPU temperature
 # and power to alerts when macmon is installed.
 #

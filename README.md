@@ -18,7 +18,7 @@ Dwarfstar is cooking …", when a runner model pushes the chip into thermal
 throttling, memory pressure or swap growth, when a server logs a failure such
 as running out of GPU memory, or when the disk holding the models runs low.
 `./watch --test` sends one to check that notifications reach you. Its
-thresholds are the `WATCH_*` ARGs in `arbiter.orch`.
+thresholds are the `WATCH_*` ARGs in the `Orchfile`.
 
 The models run ds4 from the checkout in `DWARFSTAR_DIR`, which defaults to
 `~/ds4`. If yours is elsewhere, pass it when you start the front door:
@@ -34,17 +34,14 @@ once per `./run`. `ORCH_ARG_<name>` is orch's way to override any Orchfile
 The runner keeps its own files under `~/.ds4/dwarfstar-runner`, beside ds4's
 saved sessions in `~/.ds4/kvcache`:
 
-- `logs/<service>.log`, `logs/arbiter.log` and `logs/watch.log`: each
-  server's, the arbiter's and the watch's output.
+- `logs/<service>.log`, `logs/arbiter.log` and `logs/watch.log`: everything
+  each server, the arbiter and the watch print, a failure before ds4 starts
+  included.
 - `kv/<service>/`: each model's disk KV cache, capped by the service's
   `--kv-disk-space-mb`. A vision model shares its text sibling's cache.
 
-A server that fails before ds4 starts, for instance on a wrong
-`DWARFSTAR_DIR`, reports it in orchd's own log instead:
-`~/.orch/g/dwarfstar/logs/<service>.err`.
-
 The front door reads its roster from the `Orchfile`, which has one `SERVICE`
-per model. A model is advertised only while every file in its `ENV WEIGHTS` is
+per model beside the arbiter and the watch. A model is advertised only while every file in its `ENV WEIGHTS` is
 on disk, so models appear as you download them. A request for one whose files
 are missing gets a 404 naming the absent file.
 
@@ -130,19 +127,19 @@ room for the system. It is a ceiling, not a reservation.
 The front door accepts any server that follows the conventions below, whether
 it is a `SERVICE` in the `Orchfile` or in a file of your own under `servers/`.
 
-- Every service is a model, so give each its own name. A service in
-  `servers/` with the name of one in the `Orchfile` changes that one.
+- Set `ENV MODELS` to the names clients will ask for. That is what makes a
+  service a model; the arbiter ignores a service without it.
+- Give each service its own name. A service in `servers/` with the name of one
+  in the `Orchfile` changes that one.
 - Set `DISABLED true`. orchd then starts the service only when the arbiter
-  names it. Without it, launchd starts the service at every login.
+  names it. Without it, `./run` starts the model with the front door, and
+  launchd starts it at every login.
+- Set `HEALTHCHECK` to an `http://` URL that answers 200 once the service is
+  ready. The arbiter takes the model's address from it and relays requests
+  there.
 - A file in `servers/` that does not validate over the `Orchfile` is left out
   of the roster. The arbiter reads the roster when it starts, so run `./stop`
   and `./run` after a change.
-- The `RUN` line must contain `--port N`. The arbiter reads the port from that
-  flag and connects to `127.0.0.1:N`.
-- Set `HEALTHCHECK` to a URL that answers 200 once the service is ready. Without
-  it the arbiter falls back to `http://127.0.0.1:N/v1/models`.
-- Set `ENV MODELS` to the names clients will ask for. Without it the arbiter
-  advertises the service name.
 - Set `ENV WEIGHTS` to the files the server cannot start without, separated by
   commas; `~` and `${ARG}` references work. The arbiter checks them on every
   request and advertises or raises the model only while all are on disk.
@@ -171,21 +168,30 @@ Orchfile](https://github.com/adiled/orchd#write-an-orchfile), and the model that
 gives it its vocabulary of groves, sow, plant and tend is described in [The
 Orchard Model](https://github.com/adiled/orchd/blob/main/ORCHARD.md).
 
-Each model here is a `SERVICE` in the `Orchfile`. The arbiter resolves it with
-`orch resolve --json` and treats the services as the roster.
+The `Orchfile` here is the whole runner: the arbiter, the watch, and a
+`SERVICE` per model. They share one grove, named `dwarfstar` in `.orchrc`, with
+its state in `~/.orch/g/dwarfstar`. Each service's working directory and log
+file are set with `WORKDIR`, `STDOUT` and `STDERR`, so a `RUN` line is the bare
+command.
 
-All the models share one grove, named `dwarfstar`, with its state in
-`~/.orch/g/dwarfstar`. `orchd grow <model>` starts one of them and
-`orchd fell <model>` stops one, and the rest of the grove is left alone. Every
-service is `DISABLED`, so none starts unless it is named.
+`./run` is `orchd grow`. The models are `DISABLED`, so that starts the arbiter
+and the watch and nothing else. `./stop` is `orchd fell`, which takes down the
+whole grove, a running model included. To look at the grove yourself, run this
+from the repository:
 
-The arbiter runs in its own grove, `ctl`, beside the watch and apart from the
-models. For each request it resolves the model name, asks `orchd survey` which
-model holds the GPU, stops it with `orchd fell <model>`, starts the target with
-`orchd grow <model>`, waits for the target's `HEALTHCHECK` to answer, and
-relays the request to that model's port. One switch runs at a time. Response
-streams pass through unchanged, and every connection forks its own process so a
-long switch cannot hold up other clients.
+```sh
+orchd --state-dir ~/.orch/g/dwarfstar survey
+```
+
+The arbiter resolves the `Orchfile` with `orch resolve --json` and takes every
+service that sets `ENV MODELS` as its roster. For each request it resolves the
+model name, asks `orchd survey` which model holds the GPU, stops it with
+`orchd fell <model>`, starts the target with `orchd grow <model>`, waits for
+the target's `HEALTHCHECK` to answer, and relays the request to that address.
+Felling and growing one model leaves the rest of the grove alone, the arbiter
+included. One switch runs at a time. Response streams pass through unchanged,
+and every connection forks its own process so a long switch cannot hold up
+other clients.
 
 The public interface is OpenAI's `/v1`. The `ENV MODELS` line in each service
 lists the names its model answers to, and `ENV WEIGHTS` the files it needs. Both
