@@ -32,14 +32,14 @@ note()  { printf '\n%s\n' "$1"; }
 command -v "$WME" >/dev/null 2>&1 || { echo "test.sh: $WME is not in PATH" >&2; exit 2; }
 command -v jq >/dev/null 2>&1   || { echo "test.sh: jq is not in PATH" >&2; exit 2; }
 
-# Ports declared by the grove specs, one per model.
-grove_ports() {
-    grep -h -o -E -- '--port [0-9]+' servers/*.orch 2>/dev/null | awk '{print $2}' | sort -n
+# Ports declared by the services, one per model.
+model_ports() {
+    cat Orchfile servers/*.orch 2>/dev/null | grep -o -E -- '--port [0-9]+' | awk '{print $2}' | sort -n
 }
 
 # Which of those ports is listening right now.
-live_groves() {
-    for p in $(grove_ports); do
+live_models() {
+    for p in $(model_ports); do
         lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1 && echo "$p"
     done
 }
@@ -69,35 +69,35 @@ wait_down() {
 note "1. everything down"
 ./stop
 if wait_down; then ok "front door is gone after ./stop"; else bad "front door still answers after ./stop"; fi
-check "no grove is listening" "$(live_groves | wc -l | tr -d ' ')" "0"
+check "no model is listening" "$(live_models | wc -l | tr -d ' ')" "0"
 
 note "2. front door up"
 ./run >/dev/null
 if wait_up; then ok "front door answers /v1/models"; else bad "front door did not come up"; fi
 ids=$(curl -s --max-time 5 "$FRONT/v1/models" | jq -r '.data | length' 2>/dev/null || echo 0)
 if [ "${ids:-0}" -ge 1 ]; then ok "advertises $ids model ids"; else bad "advertises no model ids"; fi
-check "no grove is loaded before the first request" "$(live_groves | wc -l | tr -d ' ')" "0"
+check "no model is loaded before the first request" "$(live_models | wc -l | tr -d ' ')" "0"
 
-note "3. wme -p on $STATION_A, which should raise the first grove"
+note "3. wme -p on $STATION_A, which should raise the first model"
 a_out=$("$WME" --station "$STATION_A" -p "$PROMPT" 2>&1 | tail -1)
 check "$STATION_A answered" "$a_out" "$EXPECT"
-a_ports=$(live_groves)
-check "exactly one grove is listening" "$(printf '%s\n' "$a_ports" | grep -c .)" "1"
+a_ports=$(live_models)
+check "exactly one model is listening" "$(printf '%s\n' "$a_ports" | grep -c .)" "1"
 
 note "4. wme -p on $STATION_B, which should swap the holder"
 b_out=$("$WME" --station "$STATION_B" -p "$PROMPT" 2>&1 | tail -1)
 check "$STATION_B answered" "$b_out" "$EXPECT"
-b_ports=$(live_groves)
-check "exactly one grove is listening" "$(printf '%s\n' "$b_ports" | grep -c .)" "1"
+b_ports=$(live_models)
+check "exactly one model is listening" "$(printf '%s\n' "$b_ports" | grep -c .)" "1"
 if [ "$a_ports" != "$b_ports" ]; then
     ok "the holder moved from :$a_ports to :$b_ports"
 else
     bad "the holder did not move, still :$a_ports"
 fi
 if printf '%s\n' "$b_ports" | grep -qx "$a_ports"; then
-    bad "the previous grove is still listening on :$a_ports"
+    bad "the previous model is still listening on :$a_ports"
 else
-    ok "the previous grove was stopped"
+    ok "the previous model was stopped"
 fi
 
 note "result"

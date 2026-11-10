@@ -5,25 +5,26 @@
  * model is serving without ever killing a process by hand. It is a pure client
  * of the orch toolchain:
  *
- *   roster : `orch parse servers/<name>.orch`          (name, port, health)
- *   start  : `orchd ... --state-dir ~/.orch/g/<name> grow`
- *   stop   : `orchd ... --state-dir ~/.orch/g/<name> fell --keep-data`
+ *   roster : `orch resolve --json Orchfile`            (name, port, health)
+ *   holder : `orchd ... --grove dwarfstar survey --json`
+ *   start  : `orchd ... --grove dwarfstar grow <name>`
+ *   stop   : `orchd ... --grove dwarfstar fell <name> --keep-data`
  *
- * A spec's ENV MODELS lists the ids its grove answers to, and ENV WEIGHTS the
+ * A service's ENV MODELS lists the ids its model answers to, and ENV WEIGHTS the
  * files its server cannot start without. Both are plain ENV directives that
- * the arbiter reads from `orch parse`. A grove whose weights are not all on
- * disk is neither advertised nor raised.
+ * the arbiter reads from `orch resolve --json`. A model whose weights are not
+ * all on disk is neither advertised nor raised.
  *
- * Each model is its own grove: one spec file, one namespace, one state dir.
- * Because orchd's `fell` tears down whatever is in its state dir, giving each
- * model its own state dir is what makes `fell` stop exactly one model. The
+ * Every model is a SERVICE in the Orchfile and a tree in one grove.
+ * `grow <name>` starts one tree and `fell <name>` stops one, and the rest of
+ * the grove stands. Any .orch file in servers/ is laid over the Orchfile. The
  * arbiter lives in its own grove, so nothing it fells can stop the arbiter.
  *
  * The GPU itself is still guarded by ds4's own flock: every model spec sets the
  * same DS4_LOCK_FILE, so at most one model ever runs.
  *
  *   GET  /v1/models       -> every advertised id
- *   POST /v1/...          -> resolve "model" -> raise the grove -> relay
+ *   POST /v1/...          -> resolve "model" -> raise its tree -> relay
  */
 
 #define _DARWIN_C_SOURCE
@@ -31,6 +32,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <glob.h>
 #include <limits.h>
 #include <netdb.h>
@@ -41,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -54,15 +57,15 @@
 #endif
 
 #define MAX_MODELS 64
+#define GROVE "dwarfstar" /* the one grove every model is planted into */
 #define RECV_MAX 65536
 
 typedef struct {
     char name[128];
-    char file[PATH_MAX];
     char host[256];
     int  port;
     char health[512];
-    char ids[1024];   /* comma-separated model ids this grove answers to */
+    char ids[1024];   /* comma-separated model ids this model answers to */
     char weights[4096]; /* comma-separated files the server needs, or empty */
 } model_t;
 
@@ -73,6 +76,7 @@ static char g_dir[PATH_MAX];
 static char g_orch[PATH_MAX];
 static char g_orchd[PATH_MAX];
 static char g_state_root[PATH_MAX];
+static char *g_files;   /* "--orchfile 'Orchfile' --overlay 'x' ...": the spec */
 static char g_listen_host[128] = "127.0.0.1";
 static int  g_listen_port = 8899;
 static int  g_timeout = 900;
@@ -134,9 +138,9 @@ static int run_status(const char *cmd) {
     return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
 }
 
-/* Whether every file in a grove's ENV WEIGHTS is on disk. A grove that names
+/* Whether every file in a model's ENV WEIGHTS is on disk. A model that names
  * a missing file cannot start, so the front door neither advertises nor
- * raises it; a grove without WEIGHTS is always available. Checked on every
+ * raises it; a model without WEIGHTS is always available. Checked on every
  * call, so a model appears once its files do. On a miss, the first absent
  * path goes to missing. */
 static int weights_present(const char *weights, char *missing, size_t missingn) {
@@ -173,39 +177,111 @@ static int port_from_cmd(const char *cmd) {
     return 0;
 }
 
-static int discover(char *err, size_t errn) {
-    char pattern[PATH_MAX];
-    snprintf(pattern, sizeof pattern, "%s/servers/*.orch", g_dir);
+typedef struct { char *buf; size_t len, cap; } sbuf_t;
 
-    glob_t gl;
-    if (glob(pattern, 0, NULL, &gl) != 0) {
-        snprintf(err, errn, "no specs matched %s", pattern);
+static void sb_add(sbuf_t *s, const char *fmt, ...) {
+    for (;;) {
+        va_list ap;
+        va_start(ap, fmt);
+        int n = s->buf ? vsnprintf(s->buf + s->len, s->cap - s->len, fmt, ap) : -1;
+        va_end(ap);
+        if (s->buf && n >= 0 && (size_t)n < s->cap - s->len) {
+            s->len += (size_t)n;
+            return;
+        }
+        if (s->buf && n < 0) return;
+        size_t cap = s->cap ? s->cap * 2 : 1024;
+        char *tmp = realloc(s->buf, cap);
+        if (!tmp) return;
+        s->buf = tmp;
+        s->cap = cap;
+    }
+}
+
+/* Append a shell-quoted word, with a flag before it if given. */
+static void add_word(sbuf_t *s, const char *flag, const char *word) {
+    sb_add(s, "%s%s%s'%s'", s->len ? " " : "", flag ? flag : "",
+           flag ? " " : "", word);
+}
+
+/*
+ * Read the roster. The spec is the Orchfile, plus every .orch file in
+ * servers/ laid over it: a place for models of your own, or for changes to a shipped one.
+ * An overlay that does not validate over the Orchfile is left out, so it
+ * cannot take the roster down with it.
+ */
+static int discover(char *err, size_t errn) {
+    char base[PATH_MAX];
+    snprintf(base, sizeof base, "%s/Orchfile", g_dir);
+    if (access(base, R_OK) != 0) {
+        snprintf(err, errn, "cannot read %s", base);
         return -1;
     }
 
-    for (size_t i = 0; i < gl.gl_pathc && nmodels < MAX_MODELS; i++) {
-        const char *file = gl.gl_pathv[i];
-        char cmd[PATH_MAX * 3];
-        snprintf(cmd, sizeof cmd, "'%s' parse '%s' 2>/dev/null", g_orch, file);
+    sbuf_t flags = {0}, files = {0};
+    add_word(&flags, "--orchfile", base);
+    add_word(&files, NULL, base);
 
-        char *json = NULL;
-        if (run_capture(cmd, &json) != 0 || !json) { free(json); continue; }
+    char pattern[PATH_MAX];
+    snprintf(pattern, sizeof pattern, "%s/servers/*.orch", g_dir);
+    glob_t gl;
+    if (glob(pattern, 0, NULL, &gl) == 0) {
+        for (size_t i = 0; i < gl.gl_pathc; i++) {
+            const char *file = gl.gl_pathv[i];
+            char cmd[PATH_MAX * 3];
+            snprintf(cmd, sizeof cmd, "'%s' validate '%s' '%s' >/dev/null 2>&1",
+                     g_orch, base, file);
+            if (run_status(cmd) != 0) {
+                logf_("%s does not validate over the Orchfile, left out", file);
+                continue;
+            }
+            add_word(&flags, "--overlay", file);
+            add_word(&files, NULL, file);
+        }
+        globfree(&gl);
+    }
+    if (!flags.buf || !files.buf) {
+        snprintf(err, errn, "out of memory");
+        return -1;
+    }
+    g_files = flags.buf;
 
-        char *name = json_get_string(json, "services[0].name");
-        char *run  = json_get_string(json, "services[0].run_command");
-        char *hc   = json_get_string(json, "services[0].healthcheck");
-        char *ids  = json_get_string(json, "services[0].env.MODELS");
-        char *wts  = json_get_string(json, "services[0].env.WEIGHTS");
+    size_t n = strlen(g_orch) + files.len + 64;
+    char *cmd = malloc(n);
+    if (!cmd) { snprintf(err, errn, "out of memory"); return -1; }
+    snprintf(cmd, n, "'%s' resolve --json %s 2>/dev/null", g_orch, files.buf);
+    free(files.buf);
+
+    char *json = NULL;
+    int rc = run_capture(cmd, &json);
+    free(cmd);
+    if (rc != 0 || !json) {
         free(json);
+        snprintf(err, errn, "%s does not resolve; try `orch validate` on it", base);
+        return -1;
+    }
 
-        if (!name || !run) {
-            free(name); free(run); free(hc); free(ids); free(wts);
+    for (int i = 0; nmodels < MAX_MODELS; i++) {
+        char path[64];
+        snprintf(path, sizeof path, "services[%d].name", i);
+        char *name = json_get_string(json, path);
+        if (!name) break;
+        snprintf(path, sizeof path, "services[%d].run_command", i);
+        char *run  = json_get_string(json, path);
+        snprintf(path, sizeof path, "services[%d].healthcheck", i);
+        char *hc   = json_get_string(json, path);
+        snprintf(path, sizeof path, "services[%d].env.MODELS", i);
+        char *ids  = json_get_string(json, path);
+        snprintf(path, sizeof path, "services[%d].env.WEIGHTS", i);
+        char *wts  = json_get_string(json, path);
+
+        if (!run) {
+            free(name); free(hc); free(ids); free(wts);
             continue;
         }
 
         model_t *m = &models[nmodels++];
         snprintf(m->name, sizeof m->name, "%s", name);
-        snprintf(m->file, sizeof m->file, "%s", file);
         snprintf(m->host, sizeof m->host, "127.0.0.1");
         m->port = port_from_cmd(run);
 
@@ -225,7 +301,7 @@ static int discover(char *err, size_t errn) {
             snprintf(m->health, sizeof m->health,
                      "http://%s:%d/v1/models", m->host, m->port);
         }
-        /* Model ids the front door advertises for this grove: ENV MODELS if
+        /* Model ids the front door advertises for this model: ENV MODELS if
          * set, else the service name. */
         snprintf(m->ids, sizeof m->ids, "%s", (ids && ids[0]) ? ids : name);
         /* Files the server cannot start without: ENV WEIGHTS, if set. */
@@ -233,10 +309,10 @@ static int discover(char *err, size_t errn) {
 
         free(name); free(run); free(hc); free(ids); free(wts);
     }
-    globfree(&gl);
+    free(json);
 
     if (nmodels == 0) {
-        snprintf(err, errn, "no services with a port under %s/servers", g_dir);
+        snprintf(err, errn, "no services in %s", base);
         return -1;
     }
     return 0;
@@ -326,26 +402,36 @@ static int http_ok(const char *url) {
     return strstr(buf, " 200") != NULL;
 }
 
-/* --- groves ------------------------------------------------------------- */
+/* --- the grove ---------------------------------------------------------- */
 
-/* `orchd --state-dir <root>/<name> ... grow` : plant + start one model. */
-static void grove_grow(const char *name, const char *file) {
-    char cmd[PATH_MAX * 4];
-    snprintf(cmd, sizeof cmd,
-             "'%s' --project-dir '%s' --state-dir '%s/%s' --orchfile '%s' "
-             "--namespace '%s' --user grow",
-             g_orchd, g_dir, g_state_root, name, file, name);
-    run_status(cmd);
+/* Build `orchd <grove flags> [the merged spec] <tail>`. Caller frees. */
+static char *orchd_cmd(int with_files, const char *tail) {
+    size_t n = PATH_MAX * 4 + strlen(g_files) + strlen(tail);
+    char *cmd = malloc(n);
+    if (!cmd) return NULL;
+    snprintf(cmd, n,
+             "'%s' --project-dir '%s' --state-dir '%s/" GROVE "' %s "
+             "--grove " GROVE " --user %s",
+             g_orchd, g_dir, g_state_root, with_files ? g_files : "", tail);
+    return cmd;
 }
 
-/* `orchd --state-dir <root>/<name> ... fell` : stop + uninstall one model. */
-static void grove_fell(const char *name) {
-    char cmd[PATH_MAX * 4];
-    snprintf(cmd, sizeof cmd,
-             "'%s' --project-dir '%s' --state-dir '%s/%s' "
-             "--namespace '%s' --user fell --keep-data",
-             g_orchd, g_dir, g_state_root, name, name);
-    run_status(cmd);
+/* `orchd ... grow <name>` : plant the grove if needed, start one model. */
+static void tree_grow(const char *name) {
+    char tail[256];
+    snprintf(tail, sizeof tail, "grow '%s'", name);
+    char *cmd = orchd_cmd(1, tail);
+    if (cmd) run_status(cmd);
+    free(cmd);
+}
+
+/* `orchd ... fell <name>` : stop one model; the rest of the grove stands. */
+static void tree_fell(const char *name) {
+    char tail[256];
+    snprintf(tail, sizeof tail, "fell '%s' --keep-data", name);
+    char *cmd = orchd_cmd(1, tail);
+    if (cmd) run_status(cmd);
+    free(cmd);
 }
 
 static int find_model(const char *name) {
@@ -354,33 +440,55 @@ static int find_model(const char *name) {
     return -1;
 }
 
+typedef struct { char name[128]; int pid; } tree_t;
+
 /*
  * Who is running, according to orchd itself. `orchd survey --json` reports a
- * PID per service; a positive PID that is still alive means the grove holds
- * the GPU. We ask orchd rather than poking launchd/plists directly — it owns
+ * row per tree with its PID; a positive PID that is still alive means that
+ * model holds the GPU. We ask orchd rather than poking launchd/plists directly — it owns
  * the lifecycle, so it owns the answer.
  *
  * (Trust the PID, not the `state` field: launchd 6.x reports `state = active`
- * while orchd 0.3.4 only maps the literal `running` to "active", so `state`
+ * while orchd only maps the literal `running` to "active", so `state`
  * reads "inactive" even for a live job. The PID is correct either way.)
  *
- * Returns the PID, or 0 when the grove is absent or not running.
+ * Fills out with the live trees and returns how many there are.
  */
-static int grove_pid(const char *name) {
-    char cmd[PATH_MAX * 4];
-    snprintf(cmd, sizeof cmd,
-             "'%s' --project-dir '%s' --state-dir '%s/%s' --namespace '%s' "
-             "--user survey --json 2>/dev/null",
-             g_orchd, g_dir, g_state_root, name, name);
-
+static int survey_live(tree_t *out, int max) {
+    char *cmd = orchd_cmd(0, "survey --json 2>/dev/null");
+    if (!cmd) return 0;
     char *json = NULL;
-    if (run_capture(cmd, &json) != 0 || !json) { free(json); return 0; }
+    int rc = run_capture(cmd, &json);
+    free(cmd);
+    if (rc != 0 || !json) { free(json); return 0; }
 
-    long pid = 0;
-    int ok = json_get_int(json, "[0].pid", &pid);
+    int n = 0;
+    for (int i = 0; n < max; i++) {
+        char path[32];
+        snprintf(path, sizeof path, "[%d].name", i);
+        char *name = json_get_string(json, path);
+        if (!name) break;
+
+        long pid = 0;
+        snprintf(path, sizeof path, "[%d].pid", i);
+        if (json_get_int(json, path, &pid) == 0 && pid > 0 &&
+            kill((pid_t)pid, 0) == 0) {
+            snprintf(out[n].name, sizeof out[n].name, "%s", name);
+            out[n].pid = (int)pid;
+            n++;
+        }
+        free(name);
+    }
     free(json);
+    return n;
+}
 
-    if (ok == 0 && pid > 0 && kill((pid_t)pid, 0) == 0) return (int)pid;
+/* The PID of one model, or 0 when it is not running. */
+static int tree_pid(const char *name) {
+    tree_t live[MAX_MODELS];
+    int n = survey_live(live, MAX_MODELS);
+    for (int i = 0; i < n; i++)
+        if (strcmp(live[i].name, name) == 0) return live[i].pid;
     return 0;
 }
 
@@ -391,35 +499,52 @@ static int switch_to(const char *name, int timeout, char *err, size_t errn) {
     int ti = find_model(name);
     if (ti < 0) { snprintf(err, errn, "unknown model"); return -2; }
 
-    /* Already the orchd holder and answering health? Nothing to do. */
-    if (grove_pid(models[ti].name) > 0 && http_ok(models[ti].health))
-        return models[ti].port;
+    /* Every connection is its own process and all of them share one grove,
+     * so one switch runs at a time. The lock goes when the fd closes. */
+    char lock[PATH_MAX];
+    snprintf(lock, sizeof lock, "%s/" GROVE ".lock", g_state_root);
+    int lfd = open(lock, O_CREAT | O_RDWR, 0644);
+    if (lfd >= 0) flock(lfd, LOCK_EX);
 
-    /* orchd is the source of truth for who is running: fell every other grove
-     * that it reports as holding a live PID. Idempotent — a grove that was
-     * never grown just falls through. */
-    for (int i = 0; i < nmodels; i++) {
-        if (i == ti) continue;
-        int pid = grove_pid(models[i].name);
-        if (pid > 0) {
-            logf_("stopping holder %s (pid %d)", models[i].name, pid);
-            grove_fell(models[i].name);
-        }
+    int port = -1;
+
+    /* orchd is the source of truth for who is running: fell every other tree
+     * it reports with a live PID. */
+    tree_t live[MAX_MODELS];
+    int n = survey_live(live, MAX_MODELS);
+    int held = 0;
+    for (int i = 0; i < n; i++)
+        if (strcmp(live[i].name, models[ti].name) == 0) held = 1;
+
+    /* Already the holder and answering health? Nothing to do. */
+    if (held && http_ok(models[ti].health)) {
+        port = models[ti].port;
+        goto done;
+    }
+
+    for (int i = 0; i < n; i++) {
+        if (strcmp(live[i].name, models[ti].name) == 0) continue;
+        logf_("stopping holder %s (pid %d)", live[i].name, live[i].pid);
+        tree_fell(live[i].name);
     }
 
     logf_("starting %s", name);
-    grove_grow(models[ti].name, models[ti].file);
+    tree_grow(models[ti].name);
 
     time_t deadline = time(NULL) + timeout;
     while (time(NULL) < deadline) {
         if (http_ok(models[ti].health)) {
             logf_("%s ready on :%d", name, models[ti].port);
-            return models[ti].port;
+            port = models[ti].port;
+            goto done;
         }
         sleep(1);
     }
     snprintf(err, errn, "%s not ready within %ds", name, timeout);
-    return -1;
+
+done:
+    if (lfd >= 0) close(lfd);
+    return port;
 }
 
 /* --- HTTP --------------------------------------------------------------- */
@@ -430,7 +555,7 @@ static void send_all(int fd, int code, const char *reason, const char *body);
 static void dispatch(int fd, const char *method, const char *path,
                      char *body, long clen, int timeout);
 
-/* Resolve a requested model id to a grove, honouring each grove's ENV MODELS. */
+/* Resolve a requested model id to a model, honouring each ENV MODELS. */
 static int find_by_model_id(const char *id) {
     size_t idl = strlen(id);
     for (int i = 0; i < nmodels; i++) {
@@ -446,7 +571,7 @@ static int find_by_model_id(const char *id) {
     return -1;
 }
 
-/* Forward an inference request to the resolved grove and relay the response
+/* Forward an inference request to the resolved model and relay the response
  * verbatim (status line, headers and body — streaming included). */
 static void proxy_to(int cfd, int ti, const char *path,
                      const char *body, long clen) {
@@ -487,22 +612,6 @@ static void proxy_to(int cfd, int ti, const char *path,
 }
 
 /* --- HTTP --------------------------------------------------------------- */
-
-typedef struct { char *buf; size_t len, cap; } sbuf_t;
-
-static void sb_add(sbuf_t *s, const char *fmt, ...) {
-    if (s->cap - s->len < 256) {
-        s->cap = s->cap ? s->cap * 2 : 1024;
-        char *tmp = realloc(s->buf, s->cap);
-        if (!tmp) return;
-        s->buf = tmp;
-    }
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(s->buf + s->len, s->cap - s->len, fmt, ap);
-    va_end(ap);
-    if (n > 0) s->len += (size_t)n;
-}
 
 static void send_all(int fd, int code, const char *reason, const char *body) {
     char hdr[256];
@@ -588,7 +697,7 @@ static void dispatch(int fd, const char *method, const char *path,
      * nothing else; model lifecycle is not its concern. */
 
     if (strcmp(method, "GET") == 0 && strcmp(q, "/v1/models") == 0) {
-        /* Every name a grove with its weights on disk answers to, so a
+        /* Every name a model with its weights on disk answers to, so a
          * client can ask for one and let the front door raise it. */
         sbuf_t s = {0};
         sb_add(&s, "{\"object\":\"list\",\"data\":[");
@@ -613,7 +722,7 @@ static void dispatch(int fd, const char *method, const char *path,
     }
 
     if (strcmp(method, "POST") == 0 && strncmp(q, "/v1/", 4) == 0) {
-        /* Read the requested model, raise its grove if needed, then stream
+        /* Read the requested model, raise it if needed, then stream
          * the backend's response back verbatim. */
         char *mid = (body && clen > 0) ? json_get_string(body, "model") : NULL;
         if (!mid) {
@@ -643,7 +752,7 @@ static void dispatch(int fd, const char *method, const char *path,
         }
         free(mid);
 
-        if (!(grove_pid(models[ti].name) > 0 && http_ok(models[ti].health))) {
+        if (!(tree_pid(models[ti].name) > 0 && http_ok(models[ti].health))) {
             char err[256] = {0};
             logf_("/v1 wants %s -> switching", models[ti].name);
             if (switch_to(models[ti].name, timeout, err, sizeof err) < 0) {
@@ -696,7 +805,7 @@ static int serve(void) {
 
     logf_("arbiter on http://%s:%d", g_listen_host, g_listen_port);
     logf_("orch: %s   orchd: %s", g_orch, g_orchd);
-    logf_("state root: %s   dir: %s", g_state_root, g_dir);
+    logf_("grove: " GROVE "   state: %s/" GROVE "   dir: %s", g_state_root, g_dir);
     for (int i = 0; i < nmodels; i++)
         logf_("  %-22s :%-6d %s", models[i].name, models[i].port, models[i].health);
 

@@ -1,5 +1,5 @@
 #!/bin/sh
-# Stop everything: every model grove, then the front door.
+# Stop everything: the model grove, then the front door.
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -8,12 +8,18 @@ ORCHD=${ORCHD:-$HOME/.local/bin/orchd}
 [ -x "$ORCHD" ] || ORCHD=orchd
 state_root=${STATE_ROOT:-$HOME/.orch/g}
 
+# The models share one grove: the Orchfile, with any servers/*.orch laid over it.
+set -- --orchfile "$ROOT/Orchfile"
 for f in "$ROOT"/servers/*.orch; do
-    n=$(basename "$f" .orch)
-    "$ORCHD" --project-dir "$ROOT" --state-dir "$state_root/$n" \
-             --namespace "$n" --user fell --keep-data >/dev/null 2>&1 || true
+    [ -e "$f" ] && set -- "$@" --overlay "$f"
 done
 
+# Fell it with its Orchfiles, or without them when they no longer resolve.
+"$ORCHD" --project-dir "$ROOT" --state-dir "$state_root/dwarfstar" "$@" \
+         --grove dwarfstar --user fell --keep-data >/dev/null 2>&1 ||
+"$ORCHD" --project-dir "$ROOT" --state-dir "$state_root/dwarfstar" \
+         --grove dwarfstar --user fell --keep-data >/dev/null 2>&1 || true
+
 "$ORCHD" --project-dir "$ROOT" --state-dir "$state_root/ctl" \
-         --orchfile "$ROOT/arbiter.orch" --namespace ctl --user fell --keep-data \
+         --orchfile "$ROOT/arbiter.orch" --grove ctl --user fell --keep-data \
          >/dev/null 2>&1 || true

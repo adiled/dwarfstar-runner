@@ -3,7 +3,7 @@
 
 /*
  * Minimal read-only JSON path lookup, enough to pull a few fields out of
- * `orch parse` output. Not a general parser: it resolves one path against a
+ * `orch resolve --json` output. Not a general parser: it resolves one path against a
  * document already in memory.
  *
  *   json_get_string("{\"a\":[{\"b\":\"hi\"}]}", "a[0].b")  ->  "hi"
